@@ -25,6 +25,8 @@ var (
 // between the nodes
 type Watcher struct {
 	url          string
+	subURL       string
+	topicURL     string
 	callbackFunc func(string)
 	connMu       *sync.RWMutex
 	ctx          context.Context
@@ -34,10 +36,24 @@ type Watcher struct {
 
 // New creates a new watcher  https://gocloud.dev/concepts/urls/
 // gcppubsub://myproject/mytopic
-func New(ctx context.Context, url string) (*Watcher, error) {
+func New(ctx context.Context, url ...string) (*Watcher, error) {
+	var subURL, topicURL string
+	if len(url) == 0 {
+		log.Panic("must pass URL")
+	} else if len(url) == 1 {
+		topicURL = url[0]
+		subURL = url[0]
+	} else if len(url) == 2 {
+		topicURL = url[0]
+		subURL = url[1]
+	} else {
+		log.Panic("does not require more than two URLs")
+	}
+
 	w := &Watcher{
-		url:    url,
-		connMu: &sync.RWMutex{},
+		topicURL: topicURL,
+		subURL:   subURL,
+		connMu:   &sync.RWMutex{},
 	}
 
 	runtime.SetFinalizer(w, finalizer)
@@ -61,7 +77,7 @@ func (w *Watcher) initializeConnections(ctx context.Context) error {
 	w.connMu.Lock()
 	defer w.connMu.Unlock()
 	w.ctx = ctx
-	topic, err := pubsub.OpenTopic(ctx, w.url)
+	topic, err := pubsub.OpenTopic(ctx, w.topicURL)
 	if err != nil {
 		return err
 	}
@@ -71,7 +87,7 @@ func (w *Watcher) initializeConnections(ctx context.Context) error {
 }
 
 func (w *Watcher) subscribeToUpdates(ctx context.Context) error {
-	sub, err := pubsub.OpenSubscription(ctx, w.url)
+	sub, err := pubsub.OpenSubscription(ctx, w.subURL)
 	if err != nil {
 		return fmt.Errorf("failed to open updates subscription, error: %w", err)
 	}
