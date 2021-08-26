@@ -1,4 +1,4 @@
-module github.com/rusenask/casbin-go-cloud-watcher
+module github.com/Fitz7/casbin-go-cloud-watcher
 
 go 1.14
 
