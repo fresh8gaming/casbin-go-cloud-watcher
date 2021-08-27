@@ -128,7 +128,7 @@ func (w *Watcher) Update() error {
 	if w.topic == nil {
 		return ErrNotConnected
 	}
-	m := &pubsub.Message{Body: []byte("")}
+	m := &pubsub.Message{Body: []byte("Casbin Update")}
 	return w.topic.Send(w.ctx, m)
 }
 
