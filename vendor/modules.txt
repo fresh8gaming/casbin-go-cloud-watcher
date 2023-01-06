@@ -350,8 +350,6 @@ github.com/rabbitmq/amqp091-go
 github.com/rcrowley/go-metrics
 # github.com/rusenask/casbin-go-cloud-watcher v0.0.0-20210430125010-5fcd1ac6993d
 ## explicit; go 1.14
-github.com/rusenask/casbin-go-cloud-watcher/drivers/mempubsub
-github.com/rusenask/casbin-go-cloud-watcher/drivers/natspubsub
 # go.opencensus.io v0.23.0
 ## explicit; go 1.13
 go.opencensus.io
