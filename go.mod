@@ -1,4 +1,4 @@
-module github.com/Fitz7/casbin-go-cloud-watcher
+module github.com/fresh8gaming/casbin-go-cloud-watcher
 
 go 1.18
 
