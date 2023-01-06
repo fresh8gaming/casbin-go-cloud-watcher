@@ -20,14 +20,13 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/nats-io/nkeys"
 
 	"github.com/nats-io/jwt/v2" // only used to decode, not for storage
 )
@@ -145,8 +144,8 @@ const (
 //
 // limit defines how many files are allowed at any given time. Set to math.MaxInt64 to disable.
 // evictOnLimit determines the behavior once limit is reached.
-// * true - Evict based on lru strategy
-// * false - return an error
+//     true - Evict based on lru strategy
+//     false - return an error
 func NewExpiringDirJWTStore(dirPath string, shard bool, create bool, delete deleteType, expireCheck time.Duration, limit int64,
 	evictOnLimit bool, ttl time.Duration, changeNotification JWTChanged, _ ...dirJWTStoreOption) (*DirJWTStore, error) {
 	fullPath, err := newDir(dirPath, create)
@@ -174,7 +173,7 @@ func NewExpiringDirJWTStore(dirPath string, shard bool, create bool, delete dele
 	theStore.Lock()
 	err = filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
 		if strings.HasSuffix(path, fileExtension) {
-			if theJwt, err := os.ReadFile(path); err == nil {
+			if theJwt, err := ioutil.ReadFile(path); err == nil {
 				hash := sha256.Sum256(theJwt)
 				_, file := filepath.Split(path)
 				theStore.expiration.track(strings.TrimSuffix(file, fileExtension), &hash, string(theJwt))
@@ -240,7 +239,7 @@ func (store *DirJWTStore) Pack(maxJWTs int) (string, error) {
 					return nil // only include indexed files
 				}
 			}
-			jwtBytes, err := os.ReadFile(path)
+			jwtBytes, err := ioutil.ReadFile(path)
 			if err != nil {
 				return err
 			}
@@ -284,7 +283,7 @@ func (store *DirJWTStore) PackWalk(maxJWTs int, cb func(partialPackMsg string)) 
 				}
 			}
 			store.Unlock()
-			jwtBytes, err := os.ReadFile(path)
+			jwtBytes, err := ioutil.ReadFile(path)
 			if err != nil {
 				return err
 			}
@@ -322,9 +321,6 @@ func (store *DirJWTStore) Merge(pack string) error {
 			return fmt.Errorf("line in package didn't contain 2 entries: %q", line)
 		}
 		pubKey := split[0]
-		if !nkeys.IsValidPublicAccountKey(pubKey) {
-			return fmt.Errorf("key to merge is not a valid public account key")
-		}
 		if err := store.saveIfNewer(pubKey, split[1]); err != nil {
 			return err
 		}
@@ -350,7 +346,7 @@ func (store *DirJWTStore) Reload() error {
 	store.Unlock()
 	return filepath.Walk(store.directory, func(path string, info os.FileInfo, err error) error {
 		if strings.HasSuffix(path, fileExtension) {
-			if theJwt, err := os.ReadFile(path); err == nil {
+			if theJwt, err := ioutil.ReadFile(path); err == nil {
 				hash := sha256.Sum256(theJwt)
 				_, file := filepath.Split(path)
 				pkey := strings.TrimSuffix(file, fileExtension)
@@ -374,9 +370,6 @@ func (store *DirJWTStore) pathForKey(publicKey string) string {
 	if len(publicKey) < 2 {
 		return _EMPTY_
 	}
-	if !nkeys.IsValidPublicKey(publicKey) {
-		return _EMPTY_
-	}
 	fileName := fmt.Sprintf("%s%s", publicKey, fileExtension)
 	if store.shard {
 		last := publicKey[len(publicKey)-2:]
@@ -393,7 +386,7 @@ func (store *DirJWTStore) load(publicKey string) (string, error) {
 	defer store.Unlock()
 	if path := store.pathForKey(publicKey); path == _EMPTY_ {
 		return _EMPTY_, fmt.Errorf("invalid public key")
-	} else if data, err := os.ReadFile(path); err != nil {
+	} else if data, err := ioutil.ReadFile(path); err != nil {
 		return _EMPTY_, err
 	} else {
 		if store.expiration != nil {
@@ -431,7 +424,7 @@ func (store *DirJWTStore) write(path string, publicKey string, theJWT string) (b
 			}
 		}
 	}
-	if err := os.WriteFile(path, []byte(theJWT), defaultFilePerms); err != nil {
+	if err := ioutil.WriteFile(path, []byte(theJWT), defaultFilePerms); err != nil {
 		return false, err
 	} else if store.expiration != nil {
 		store.expiration.track(publicKey, newHash, theJWT)
@@ -495,7 +488,7 @@ func (store *DirJWTStore) save(publicKey string, theJWT string) error {
 }
 
 // Assumes the lock is NOT held, and only updates if the jwt is new, or the one on disk is older
-// When changed, invokes jwt changed callback
+// returns true when the jwt changed
 func (store *DirJWTStore) saveIfNewer(publicKey string, theJWT string) error {
 	if store.readonly {
 		return fmt.Errorf("store is read-only")
@@ -512,8 +505,8 @@ func (store *DirJWTStore) saveIfNewer(publicKey string, theJWT string) error {
 	}
 	if _, err := os.Stat(path); err == nil {
 		if newJWT, err := jwt.DecodeGeneric(theJWT); err != nil {
-			return err
-		} else if existing, err := os.ReadFile(path); err != nil {
+			// skip if it can't be decoded
+		} else if existing, err := ioutil.ReadFile(path); err != nil {
 			return err
 		} else if existingJWT, err := jwt.DecodeGeneric(string(existing)); err != nil {
 			// skip if it can't be decoded
@@ -521,10 +514,6 @@ func (store *DirJWTStore) saveIfNewer(publicKey string, theJWT string) error {
 			return nil
 		} else if existingJWT.IssuedAt > newJWT.IssuedAt {
 			return nil
-		} else if newJWT.Subject != publicKey {
-			return fmt.Errorf("jwt subject nkey and provided nkey do not match")
-		} else if existingJWT.Subject != newJWT.Subject {
-			return fmt.Errorf("subject of existing and new jwt do not match")
 		}
 	}
 	store.Lock()

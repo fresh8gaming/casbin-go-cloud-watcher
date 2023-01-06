@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/internal/log"
@@ -58,9 +57,8 @@ type Receiver struct {
 	mu        sync.Mutex
 	receiving bool
 
+	defaultDrainTimeout      time.Duration
 	defaultTimeAfterFirstMsg time.Duration
-
-	cancelReleaser *atomic.Value
 }
 
 // ReceiverOptions contains options for the `Client.NewReceiverForQueue` or `Client.NewReceiverForSubscription`
@@ -121,10 +119,6 @@ type newReceiverArgs struct {
 	retryOptions        RetryOptions
 }
 
-var emptyCancelFn = func() string {
-	return "empty"
-}
-
 func newReceiver(args newReceiverArgs, options *ReceiverOptions) (*Receiver, error) {
 	if err := args.ns.Check(); err != nil {
 		return nil, err
@@ -133,12 +127,10 @@ func newReceiver(args newReceiverArgs, options *ReceiverOptions) (*Receiver, err
 	receiver := &Receiver{
 		lastPeekedSequenceNumber: 0,
 		cleanupOnClose:           args.cleanupOnClose,
+		defaultDrainTimeout:      time.Second,
 		defaultTimeAfterFirstMsg: 20 * time.Millisecond,
 		retryOptions:             args.retryOptions,
-		cancelReleaser:           &atomic.Value{},
 	}
-
-	receiver.cancelReleaser.Store(emptyCancelFn)
 
 	if err := applyReceiverOptions(receiver, &args.entity, options); err != nil {
 		return nil, err
@@ -170,8 +162,8 @@ func newReceiver(args newReceiverArgs, options *ReceiverOptions) (*Receiver, err
 }
 
 func (r *Receiver) newReceiverLink(ctx context.Context, session amqpwrap.AMQPSession) (internal.AMQPSenderCloser, internal.AMQPReceiverCloser, error) {
-	linkOptions := createLinkOptions(r.receiveMode)
-	link, err := session.NewReceiver(ctx, r.entityPath, linkOptions)
+	linkOptions := createLinkOptions(r.receiveMode, r.entityPath)
+	link, err := createReceiverLink(ctx, session, linkOptions)
 	return nil, link, err
 }
 
@@ -297,7 +289,7 @@ type RenewMessageLockOptions struct {
 // If the operation fails it can return an *azservicebus.Error type if the failure is actionable.
 func (r *Receiver) RenewMessageLock(ctx context.Context, msg *ReceivedMessage, options *RenewMessageLockOptions) error {
 	err := r.amqpLinks.Retry(ctx, EventReceiver, "renewMessageLock", func(ctx context.Context, linksWithVersion *internal.LinksWithID, args *utils.RetryFnArgs) error {
-		newExpirationTime, err := internal.RenewLocks(ctx, linksWithVersion.RPC, msg.RawAMQPMessage.linkName, []amqp.UUID{
+		newExpirationTime, err := internal.RenewLocks(ctx, linksWithVersion.RPC, msg.rawAMQPMessage.LinkName(), []amqp.UUID{
 			(amqp.UUID)(msg.LockToken),
 		})
 
@@ -314,10 +306,6 @@ func (r *Receiver) RenewMessageLock(ctx context.Context, msg *ReceivedMessage, o
 
 // Close permanently closes the receiver.
 func (r *Receiver) Close(ctx context.Context) error {
-	cancelReleaser := r.cancelReleaser.Swap(emptyCancelFn).(func() string)
-	releaserID := cancelReleaser()
-	log.Writef(EventReceiver, "Stopped message releaser with ID '%s'", releaserID)
-
 	r.cleanupOnClose()
 	return r.amqpLinks.Close(ctx, true)
 }
@@ -356,8 +344,7 @@ func (r *Receiver) DeadLetterMessage(ctx context.Context, message *ReceivedMessa
 }
 
 func (r *Receiver) receiveMessagesImpl(ctx context.Context, maxMessages int, options *ReceiveMessagesOptions) ([]*ReceivedMessage, error) {
-	cancelReleaser := r.cancelReleaser.Swap(emptyCancelFn).(func() string)
-	_ = cancelReleaser()
+	var all []*ReceivedMessage
 
 	var linksWithID *internal.LinksWithID
 
@@ -370,67 +357,142 @@ func (r *Receiver) receiveMessagesImpl(ctx context.Context, maxMessages int, opt
 		return nil, err
 	}
 
-	// request just the right amount of credits, taking into account the credits
-	// that are already active on the link from prior ReceiveMessages() calls that
-	// might have exited before all credits were used up.
-	currentReceiverCredits := int64(linksWithID.Receiver.Credits())
-	creditsToIssue := int64(maxMessages) - currentReceiverCredits
-	log.Writef(EventReceiver, "Asking for %d credits", maxMessages)
-
-	if creditsToIssue > 0 {
-		log.Writef(EventReceiver, "Only need to issue %d additional credits", creditsToIssue)
-
-		if err := linksWithID.Receiver.IssueCredit(uint32(creditsToIssue)); err != nil {
-			return nil, err
+	cleanup := func(err error) {
+		if err != nil {
+			if internal.IsCancelError(err) {
+				// if the user cancelled any of the "cleanup" operations then the link
+				// is an indeterminate state and should just be closed. It'll get recreated
+				// on the next operation.
+				log.Writef(EventReceiver, "Closing link due to cancellation")
+				_ = r.amqpLinks.Close(context.Background(), false)
+			} else {
+				log.Writef(EventReceiver, "Closing link/connection (potentially) for error %v", err)
+				_ = r.amqpLinks.CloseIfNeeded(context.Background(), err)
+			}
 		}
-	} else {
-		log.Writef(EventReceiver, "No additional credits needed, still have %d credits active", currentReceiverCredits)
 	}
 
-	result := r.fetchMessages(ctx, linksWithID.Receiver, maxMessages, r.defaultTimeAfterFirstMsg)
+	flushAndReturn := func(lastErr error) ([]*ReceivedMessage, error) {
+		flushPrefetchedMessages(linksWithID.Receiver, &all)
 
-	log.Writef(EventReceiver, "Received %d/%d messages", len(result.Messages), maxMessages)
+		if len(all) > 0 {
+			// users don't typically check the other values in the return if the 'err' is non-nil
+			// so if we have any messages we'll just return them and nil out the error.
+			// If it's persistent they'll see it on their next ReceiveMessages() call.
+			log.Writef(EventReceiver, "Received %d/%d messages", len(all), maxMessages)
+			return all, nil
+		} else {
+			if internal.GetRecoveryKind(lastErr) == internal.RecoveryKindFatal {
+				log.Writef(EventReceiver, "Fatal error when receiving: %#v", lastErr)
+				return nil, lastErr
+			}
 
-	// this'll only close anything if the error indicates that the link/connection is bad.
-	// it's safe to call with cancellation errors.
-	rk := r.amqpLinks.CloseIfNeeded(context.Background(), result.Error)
-
-	if rk == internal.RecoveryKindNone {
-		// The link is still alive - we'll start the releaser which will releasing any messages
-		// that arrive between this call and the next call to ReceiveMessages().
-		//
-		// This prevents us from holding onto messages for a long period of time in our
-		// internal cache where they'll just keep expiring.
-		releaserFunc := r.newReleaserFunc(linksWithID.Receiver)
-		go releaserFunc()
-	} else {
-		log.Writef(EventReceiver, "Failure when receiving messages: %s", result.Error)
+			// there's no material difference here, so let them fail on the next call to ReceiveMessages() instead.
+			log.Writef(EventReceiver, "Non-fatal error occurred and no messages were received. Will recover on next call: %v", lastErr)
+			return nil, nil
+		}
 	}
 
-	// If the user does get some messages we ignore 'error' and return only the messages.
-	//
-	// Doing otherwise would break the idiom that people are used to where people expected
-	// a non-nil error to mean any other values in the return are nil or not useful (ie,
-	// partial success is not idiomatic).
-	//
-	// This is mostly safe because the next call to ReceiveMessages() (or any other
-	// function on Receiver).will have the same issue and will return the relevant error
-	// at that time
-	if len(result.Messages) == 0 {
-		if internal.IsCancelError(result.Error) || rk == internal.RecoveryKindFatal {
-			return nil, result.Error
+	if err := fetchMessages(ctx, linksWithID.Receiver, maxMessages, r.defaultTimeAfterFirstMsg, &all); err != nil {
+		// if the user's cancelled the fetch we'll fall through and let the drain happen.
+		if !internal.IsCancelError(err) {
+			// If the user didn't cancel then we had an actual failure that's going to require a
+			// link/connection reset. Close links and return whatever we can.
+			cleanup(err)
+			return flushAndReturn(err)
 		}
 
-		return nil, nil
+		// user cancelled (or we hit our "afte first message" timer).
+		// Fall through so we drain the link since it's still active.
+		log.Writef(EventReceiver, "Context has been cancelled")
 	}
 
-	var receivedMessages []*ReceivedMessage
+	if len(all) < maxMessages { // drain if there are excess credits
+		log.Writef(EventReceiver, "Draining to clear %d credits", maxMessages-len(all))
 
-	for _, msg := range result.Messages {
-		receivedMessages = append(receivedMessages, newReceivedMessage(msg))
+		drainCtx, drainCtxcancel := context.WithTimeout(context.Background(), r.defaultDrainTimeout)
+		defer drainCtxcancel()
+
+		// Start the drain asynchronously. Note that we ignore the user's context at this point
+		// since draining makes sure we don't get messages when nobody is receiving.
+		if err := linksWithID.Receiver.DrainCredit(drainCtx); err != nil {
+			// Cancelling a DrainCredit means we're in an indeterminate state
+			// so we treat that as a "must recover" error.
+			cleanup(err)
+
+			if internal.IsCancelError(err) {
+				log.Writef(EventReceiver, "Drain didn't complete in %s, link was recreated", r.defaultDrainTimeout)
+
+				// this cancellation is entirely on us - we cleaned up as best we can
+				// but the user isn't expected to know about this detail so we don't
+				// return the cancellation error.
+				err = nil
+			}
+
+			return flushAndReturn(err)
+		}
+
+		return flushAndReturn(ctx.Err())
 	}
 
-	return receivedMessages, nil
+	// we only get here if we got exactly the # of messages they asked for
+	// in the initial set of link.Receive() calls above.
+	log.Writef(EventReceiver, "Received %d/%d messages", len(all), maxMessages)
+	return all, nil
+}
+
+func fetchMessages(ctx context.Context, receiver internal.AMQPReceiver, maxMessages int, defaultTimeAfterFirstMessage time.Duration, messages *[]*ReceivedMessage) error {
+	log.Writef(EventReceiver, "Fetching messages, issuing %d credits", maxMessages)
+
+	if err := receiver.IssueCredit(uint32(maxMessages)); err != nil {
+		return err
+	}
+
+	var cancel context.CancelFunc
+
+	for {
+		amqpMessage, err := receiver.Receive(ctx)
+
+		if err != nil {
+			return err
+		}
+
+		*messages = append(*messages, newReceivedMessage(amqpMessage))
+
+		if len(*messages) == maxMessages {
+			return nil
+		}
+
+		if cancel == nil {
+			// replace the context that we're using for everything with a new one that will cancel
+			// after a period of time.
+			ctx, cancel = context.WithTimeout(ctx, defaultTimeAfterFirstMessage)
+			defer cancel()
+		}
+	}
+}
+
+// flushPrefetchedMessages makes a best-effort attempt at flushing the internal channel for the link. This is
+// a purely in-memory operation so should work even if the link itself has failed.
+func flushPrefetchedMessages(receiver internal.AMQPReceiver, messages *[]*ReceivedMessage) {
+	count := 0
+	defer func() {
+		if count > 0 {
+			log.Writef(EventReceiver, "Flushed %d messages from receiver's internal cache", count)
+		}
+	}()
+
+	for {
+		am, err := receiver.Prefetched(context.Background())
+
+		// we've removed any code of consequence from Prefetched.
+		if am == nil || err != nil {
+			return
+		}
+
+		*messages = append(*messages, newReceivedMessage(am))
+		count++
+	}
 }
 
 type entity struct {
@@ -471,24 +533,64 @@ func (e *entity) SetSubQueue(subQueue SubQueue) error {
 	return fmt.Errorf("unknown SubQueue %d", subQueue)
 }
 
-func createLinkOptions(mode ReceiveMode) *amqp.ReceiverOptions {
+func createReceiverLink(ctx context.Context, session amqpwrap.AMQPSession, linkOptions []amqp.LinkOption) (internal.AMQPReceiverCloser, error) {
+	// If you're doing an AcceptNextSession it's possible for this call to take a long time before timing out
+	// on its own (it's by design - it's waiting for any empty session to become available).
+	type ret = struct {
+		Receiver internal.AMQPReceiverCloser
+		Err      error
+	}
+
+	done := make(chan ret, 1)
+
+	go func(ctx context.Context) {
+		defer close(done)
+
+		tmpReceiver, tmpErr := session.NewReceiver(linkOptions...)
+		done <- ret{Receiver: tmpReceiver, Err: tmpErr}
+	}(ctx)
+
+	select {
+	case data := <-done:
+		return data.Receiver, data.Err
+	case <-ctx.Done():
+		go func() {
+			data := <-done
+
+			if data.Err == nil {
+				// `createReceiverLink` will have already returned with a cancellation based error,
+				// so this goroutine just needs to make sure we close this link that nobody is going
+				// to use.
+				_ = data.Receiver.Close(context.Background())
+			}
+		}()
+
+		// we'll early exit if cancelled - the goroutine above
+		// will just close the no-longer-needed link if/when it
+		// returns successfully.
+		return nil, ctx.Err()
+	}
+}
+
+func createLinkOptions(mode ReceiveMode, entityPath string) []amqp.LinkOption {
 	receiveMode := amqp.ModeSecond
 
 	if mode == ReceiveModeReceiveAndDelete {
 		receiveMode = amqp.ModeFirst
 	}
 
-	receiverOpts := &amqp.ReceiverOptions{
-		SettlementMode: receiveMode.Ptr(),
-		ManualCredits:  true,
-		Credit:         defaultLinkRxBuffer,
+	opts := []amqp.LinkOption{
+		amqp.LinkSourceAddress(entityPath),
+		amqp.LinkReceiverSettle(receiveMode),
+		amqp.LinkWithManualCredits(),
+		amqp.LinkCredit(defaultLinkRxBuffer),
 	}
 
 	if mode == ReceiveModeReceiveAndDelete {
-		receiverOpts.RequestedSenderSettleMode = amqp.ModeSettled.Ptr()
+		opts = append(opts, amqp.LinkSenderSettle(amqp.ModeSettled))
 	}
 
-	return receiverOpts
+	return opts
 }
 
 func checkReceiverMode(receiveMode ReceiveMode) error {
@@ -497,150 +599,4 @@ func checkReceiverMode(receiveMode ReceiveMode) error {
 	}
 
 	return fmt.Errorf("invalid receive mode %d, must be either azservicebus.PeekLock or azservicebus.ReceiveAndDelete", receiveMode)
-}
-
-// fetchMessagesResult is the result from a fetchMessages
-// call.
-// NOTE: that you can get both an error and messages!
-type fetchMessagesResult struct {
-	Messages []*amqp.Message
-	Error    error
-}
-
-// fetchMessages receives messages, blocking indefinitely until at least one
-// message arrives, the parentCtx parameter is cancelled, or the receiver itself
-// is disconnected from Service Bus.
-//
-// Note, if you want to only receive prefetched messages send the parentCtx in
-// pre-cancelled. This will cause us to only flush the prefetch buffer.
-func (r *Receiver) fetchMessages(parentCtx context.Context, receiver amqpwrap.AMQPReceiver, count int, timeAfterFirstMessage time.Duration) fetchMessagesResult {
-	// The first receive is a bit special - we activate a short timer after this
-	// so the user doesn't end up in a situation where we're holding onto a bunch
-	// of messages but never return because they never cancelled and we never
-	// received all 'count' number of messages.
-	firstMsg, err := receiver.Receive(parentCtx)
-
-	if err != nil {
-		// drain the prefetch buffer - we're stopping because of a
-		// failure on the link/connection _or_ the user cancelled the
-		// operation.
-		return fetchMessagesResult{
-			Error: err,
-			// Since our link is always active it's possible some
-			// messages were sitting in the prefetched buffer from before
-			//
-			// This particularly affects us in ReceiveAndDelete mode since the
-			// local copy of the message can never be retrieved from the server
-			// again (they're pre-settled).
-			Messages: getAllPrefetched(receiver, count),
-		}
-	}
-
-	messages := []*amqp.Message{firstMsg}
-
-	// after we get one message we will try to receive as much as we can
-	// during the `timeAfterFirstMessage` duration.
-	ctx, cancel := context.WithTimeout(parentCtx, timeAfterFirstMessage)
-	defer cancel()
-
-	var lastErr error
-
-	for i := 0; i < count-1; i++ {
-		msg, err := receiver.Receive(ctx)
-
-		if err != nil {
-			lastErr = err
-			break
-		}
-
-		messages = append(messages, msg)
-	}
-
-	// drain the prefetch buffer - we're stopping because of a
-	// failure on the link/connection _or_ the user cancelled the
-	// operation.
-	messages = append(messages, getAllPrefetched(receiver, count-len(messages))...)
-
-	if internal.IsCancelError(lastErr) {
-		return fetchMessagesResult{
-			Messages: messages,
-			// we might have cancelled here (because we stop receiving after `timeAfterFirstMessage` expires)
-			// or _they_ cancelled the ReceiveMessages() call.
-			//
-			// If we cancel: we want a nil error since there's no failure. In that case parentCtx.Err() is nil
-			// If they cancel: we want to forward on their cancellation error.
-			Error: parentCtx.Err(),
-		}
-	} else {
-		return fetchMessagesResult{
-			Error:    lastErr,
-			Messages: messages,
-		}
-	}
-}
-
-// newReleaserFunc creates a function that continually receives on a
-// receiver and amqpReceiver.Release(msg)'s until cancelled. We use this
-// lieu of a 'drain' strategy so we don't hold onto messages in our internal
-// cache only for them to expire.
-func (r *Receiver) newReleaserFunc(receiver amqpwrap.AMQPReceiver) func() {
-	if r.receiveMode == ReceiveModeReceiveAndDelete {
-		// you can't disposition messages that are received in this mode - these messages
-		// are "presettled" so we do NOT want to discard these messages.
-		return func() {}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	released := 0
-
-	// this func gets called when a new ReceiveMessages() starts
-	r.cancelReleaser.Store(func() string {
-		cancel()
-		<-done
-		return receiver.LinkName()
-	})
-
-	return func() {
-		defer close(done)
-
-		log.Writef(EventReceiver, "[%s] Message releaser starting...", receiver.LinkName())
-
-		for {
-			// we might not have all the messages we need here.
-			msg, err := receiver.Receive(ctx)
-
-			if err == nil {
-				err = receiver.ReleaseMessage(ctx, msg)
-			}
-
-			if err == nil {
-				released++
-			}
-
-			if internal.IsCancelError(err) {
-				log.Writef(exported.EventReceiver, "[%s] Message releaser pausing. Released %d messages", receiver.LinkName(), released)
-				break
-			} else if internal.GetRecoveryKind(err) != internal.RecoveryKindNone {
-				log.Writef(exported.EventReceiver, "[%s] Message releaser stopping because of link failure. Released %d messages. Will start again after next receive: %s", receiver.LinkName(), released, err)
-				break
-			}
-		}
-	}
-}
-
-func getAllPrefetched(receiver amqpwrap.AMQPReceiver, max int) []*amqp.Message {
-	var messages []*amqp.Message
-
-	for i := 0; i < max; i++ {
-		msg := receiver.Prefetched()
-
-		if msg == nil {
-			break
-		}
-
-		messages = append(messages, msg)
-	}
-
-	return messages
 }

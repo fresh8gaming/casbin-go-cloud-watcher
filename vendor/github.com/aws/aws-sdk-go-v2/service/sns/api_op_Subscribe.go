@@ -81,26 +81,17 @@ type SubscribeInput struct {
 	// JSON object that lets your subscriber receive only a subset of messages, rather
 	// than receiving every message published to the topic.
 	//
-	// * FilterPolicyScope – This
-	// attribute lets you choose the filtering scope by using one of the following
-	// string value types:
+	// * RawMessageDelivery –
+	// When set to true, enables raw message delivery to Amazon SQS or HTTP/S
+	// endpoints. This eliminates the need for the endpoints to process JSON
+	// formatting, which is otherwise created for Amazon SNS metadata.
 	//
-	// * MessageAttributes (default) – The filter is applied on
-	// the message attributes.
-	//
-	// * MessageBody – The filter is applied on the message
-	// body.
-	//
-	// * RawMessageDelivery – When set to true, enables raw message delivery to
-	// Amazon SQS or HTTP/S endpoints. This eliminates the need for the endpoints to
-	// process JSON formatting, which is otherwise created for Amazon SNS metadata.
-	//
-	// *
-	// RedrivePolicy – When specified, sends undeliverable messages to the specified
-	// Amazon SQS dead-letter queue. Messages that can't be delivered due to client
-	// errors (for example, when the subscribed endpoint is unreachable) or server
-	// errors (for example, when the service that powers the subscribed endpoint
-	// becomes unavailable) are held in the dead-letter queue for further analysis or
+	// * RedrivePolicy
+	// – When specified, sends undeliverable messages to the specified Amazon SQS
+	// dead-letter queue. Messages that can't be delivered due to client errors (for
+	// example, when the subscribed endpoint is unreachable) or server errors (for
+	// example, when the service that powers the subscribed endpoint becomes
+	// unavailable) are held in the dead-letter queue for further analysis or
 	// reprocessing.
 	//
 	// The following attribute applies only to Amazon Kinesis Data

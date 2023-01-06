@@ -16,7 +16,7 @@ package pubsub
 
 import (
 	"cloud.google.com/go/iam"
-	"cloud.google.com/go/pubsub/apiv1/pubsubpb"
+	pubsubpb "google.golang.org/genproto/googleapis/pubsub/v1"
 )
 
 func (c *PublisherClient) SubscriptionIAM(subscription *pubsubpb.Subscription) *iam.Handle {

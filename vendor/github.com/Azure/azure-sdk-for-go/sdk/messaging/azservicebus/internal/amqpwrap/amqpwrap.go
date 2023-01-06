@@ -14,22 +14,18 @@ import (
 // AMQPReceiver is implemented by *amqp.Receiver
 type AMQPReceiver interface {
 	IssueCredit(credit uint32) error
+	DrainCredit(ctx context.Context) error
 	Receive(ctx context.Context) (*amqp.Message, error)
-	Prefetched() *amqp.Message
+	Prefetched(ctx context.Context) (*amqp.Message, error)
 
 	// settlement functions
 	AcceptMessage(ctx context.Context, msg *amqp.Message) error
 	RejectMessage(ctx context.Context, msg *amqp.Message, e *amqp.Error) error
 	ReleaseMessage(ctx context.Context, msg *amqp.Message) error
-	ModifyMessage(ctx context.Context, msg *amqp.Message, options *amqp.ModifyMessageOptions) error
+	ModifyMessage(ctx context.Context, msg *amqp.Message, deliveryFailed, undeliverableHere bool, messageAnnotations amqp.Annotations) error
 
 	LinkName() string
 	LinkSourceFilterValue(name string) interface{}
-
-	// wrapper only functions,
-
-	// Credits returns the # of credits still active on this link.
-	Credits() uint32
 }
 
 // AMQPReceiverCloser is implemented by *amqp.Receiver
@@ -55,13 +51,13 @@ type AMQPSenderCloser interface {
 // It exists only so we can return AMQPReceiver/AMQPSender interfaces.
 type AMQPSession interface {
 	Close(ctx context.Context) error
-	NewReceiver(ctx context.Context, source string, opts *amqp.ReceiverOptions) (AMQPReceiverCloser, error)
-	NewSender(ctx context.Context, target string, opts *amqp.SenderOptions) (AMQPSenderCloser, error)
+	NewReceiver(opts ...amqp.LinkOption) (AMQPReceiverCloser, error)
+	NewSender(opts ...amqp.LinkOption) (AMQPSenderCloser, error)
 }
 
 type AMQPClient interface {
 	Close() error
-	NewSession(ctx context.Context, opts *amqp.SessionOptions) (AMQPSession, error)
+	NewSession(opts ...amqp.SessionOption) (AMQPSession, error)
 }
 
 // AMQPClientWrapper is a simple interface, implemented by *AMQPClientWrapper
@@ -75,8 +71,8 @@ func (w *AMQPClientWrapper) Close() error {
 	return w.Inner.Close()
 }
 
-func (w *AMQPClientWrapper) NewSession(ctx context.Context, opts *amqp.SessionOptions) (AMQPSession, error) {
-	sess, err := w.Inner.NewSession(ctx, opts)
+func (w *AMQPClientWrapper) NewSession(opts ...amqp.SessionOption) (AMQPSession, error) {
+	sess, err := w.Inner.NewSession(opts...)
 
 	if err != nil {
 		return nil, err
@@ -95,92 +91,22 @@ func (w *AMQPSessionWrapper) Close(ctx context.Context) error {
 	return w.Inner.Close(ctx)
 }
 
-func (w *AMQPSessionWrapper) NewReceiver(ctx context.Context, source string, opts *amqp.ReceiverOptions) (AMQPReceiverCloser, error) {
-	receiver, err := w.Inner.NewReceiver(ctx, source, opts)
+func (w *AMQPSessionWrapper) NewReceiver(opts ...amqp.LinkOption) (AMQPReceiverCloser, error) {
+	receiver, err := w.Inner.NewReceiver(opts...)
 
 	if err != nil {
 		return nil, err
 	}
 
-	return &AMQPReceiverWrapper{inner: receiver}, nil
+	return receiver, nil
 }
 
-func (w *AMQPSessionWrapper) NewSender(ctx context.Context, target string, opts *amqp.SenderOptions) (AMQPSenderCloser, error) {
-	sender, err := w.Inner.NewSender(ctx, target, opts)
+func (w *AMQPSessionWrapper) NewSender(opts ...amqp.LinkOption) (AMQPSenderCloser, error) {
+	sender, err := w.Inner.NewSender(opts...)
 
 	if err != nil {
 		return nil, err
 	}
 
 	return sender, nil
-}
-
-type AMQPReceiverWrapper struct {
-	inner   *amqp.Receiver
-	credits uint32
-}
-
-func (rw *AMQPReceiverWrapper) Credits() uint32 {
-	return rw.credits
-}
-
-func (rw *AMQPReceiverWrapper) IssueCredit(credit uint32) error {
-	err := rw.inner.IssueCredit(credit)
-
-	if err == nil {
-		rw.credits += credit
-	}
-
-	return err
-}
-
-func (rw *AMQPReceiverWrapper) Receive(ctx context.Context) (*amqp.Message, error) {
-	message, err := rw.inner.Receive(ctx)
-
-	if err != nil {
-		return nil, err
-	}
-
-	rw.credits--
-	return message, nil
-}
-
-func (rw *AMQPReceiverWrapper) Prefetched() *amqp.Message {
-	msg := rw.inner.Prefetched()
-
-	if msg == nil {
-		return nil
-	}
-
-	rw.credits--
-	return msg
-}
-
-// settlement functions
-func (rw *AMQPReceiverWrapper) AcceptMessage(ctx context.Context, msg *amqp.Message) error {
-	return rw.inner.AcceptMessage(ctx, msg)
-}
-
-func (rw *AMQPReceiverWrapper) RejectMessage(ctx context.Context, msg *amqp.Message, e *amqp.Error) error {
-	return rw.inner.RejectMessage(ctx, msg, e)
-}
-
-func (rw *AMQPReceiverWrapper) ReleaseMessage(ctx context.Context, msg *amqp.Message) error {
-	return rw.inner.ReleaseMessage(ctx, msg)
-}
-
-func (rw *AMQPReceiverWrapper) ModifyMessage(ctx context.Context, msg *amqp.Message, options *amqp.ModifyMessageOptions) error {
-	return rw.inner.ModifyMessage(ctx, msg, options)
-}
-
-func (rw *AMQPReceiverWrapper) LinkName() string {
-	return rw.inner.LinkName()
-}
-
-func (rw *AMQPReceiverWrapper) LinkSourceFilterValue(name string) interface{} {
-	return rw.inner.LinkSourceFilterValue(name)
-}
-
-func (rw *AMQPReceiverWrapper) Close(ctx context.Context) error {
-	return rw.inner.Close(ctx)
 }

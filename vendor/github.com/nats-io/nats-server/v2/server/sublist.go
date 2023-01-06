@@ -427,6 +427,7 @@ func (s *Sublist) Insert(sub *subscription) error {
 	} else {
 		if n.qsubs == nil {
 			n.qsubs = make(map[string]map[*subscription]*subscription)
+			isnew = true
 		}
 		qname := string(sub.queue)
 		// This is a queue subscription
@@ -434,7 +435,6 @@ func (s *Sublist) Insert(sub *subscription) error {
 		if !ok {
 			subs = make(map[*subscription]*subscription)
 			n.qsubs[qname] = subs
-			isnew = true
 		}
 		subs[sub] = sub
 	}
@@ -892,10 +892,8 @@ func (s *Sublist) removeFromNode(n *node, sub *subscription) (found, last bool) 
 	_, found = qsub[sub]
 	delete(qsub, sub)
 	if len(qsub) == 0 {
-		// This is the last queue subscription interest when len(qsub) == 0, not
-		// when n.qsubs is empty.
-		last = true
 		delete(n.qsubs, string(sub.queue))
+		last = len(n.qsubs) == 0
 	}
 	return found, last
 }
@@ -927,7 +925,6 @@ type SublistStats struct {
 	AvgFanout    float64 `json:"avg_fanout"`
 	totFanout    int
 	cacheCnt     int
-	cacheHits    uint64
 }
 
 func (s *SublistStats) add(stat *SublistStats) {
@@ -936,7 +933,7 @@ func (s *SublistStats) add(stat *SublistStats) {
 	s.NumInserts += stat.NumInserts
 	s.NumRemoves += stat.NumRemoves
 	s.NumMatches += stat.NumMatches
-	s.cacheHits += stat.cacheHits
+	s.CacheHitRate += stat.CacheHitRate
 	if s.MaxFanout < stat.MaxFanout {
 		s.MaxFanout = stat.MaxFanout
 	}
@@ -947,9 +944,6 @@ func (s *SublistStats) add(stat *SublistStats) {
 	s.cacheCnt += stat.cacheCnt
 	if s.totFanout > 0 {
 		s.AvgFanout = float64(s.totFanout) / float64(s.cacheCnt)
-	}
-	if s.NumMatches > 0 {
-		s.CacheHitRate = float64(s.cacheHits) / float64(s.NumMatches)
 	}
 }
 
@@ -967,9 +961,8 @@ func (s *Sublist) Stats() *SublistStats {
 
 	st.NumCache = uint32(cc)
 	st.NumMatches = atomic.LoadUint64(&s.matches)
-	st.cacheHits = atomic.LoadUint64(&s.cacheHits)
 	if st.NumMatches > 0 {
-		st.CacheHitRate = float64(st.cacheHits) / float64(st.NumMatches)
+		st.CacheHitRate = float64(atomic.LoadUint64(&s.cacheHits)) / float64(st.NumMatches)
 	}
 
 	// whip through cache for fanout stats, this can be off if cache is full and doing evictions.
@@ -1068,11 +1061,10 @@ func IsValidSubject(subject string) bool {
 	sfwc := false
 	tokens := strings.Split(subject, tsep)
 	for _, t := range tokens {
-		length := len(t)
-		if length == 0 || sfwc {
+		if len(t) == 0 || sfwc {
 			return false
 		}
-		if length > 1 {
+		if len(t) > 1 {
 			if strings.ContainsAny(t, "\t\n\f\r ") {
 				return false
 			}
@@ -1136,39 +1128,6 @@ func isValidLiteralSubject(tokens []string) bool {
 	return true
 }
 
-// ValidateMappingDestination returns nil error if the subject is a valid subject mapping destination subject
-func ValidateMappingDestination(subject string) error {
-	subjectTokens := strings.Split(subject, tsep)
-	sfwc := false
-	for _, t := range subjectTokens {
-		length := len(t)
-		if length == 0 || sfwc {
-			return &mappingDestinationErr{t, ErrInvalidMappingDestinationSubject}
-		}
-
-		if length > 4 && t[0] == '{' && t[1] == '{' && t[length-2] == '}' && t[length-1] == '}' {
-			if !partitionMappingFunctionRegEx.MatchString(t) &&
-				!wildcardMappingFunctionRegEx.MatchString(t) &&
-				!splitFromLeftMappingFunctionRegEx.MatchString(t) &&
-				!splitFromRightMappingFunctionRegEx.MatchString(t) &&
-				!sliceFromLeftMappingFunctionRegEx.MatchString(t) &&
-				!sliceFromRightMappingFunctionRegEx.MatchString(t) &&
-				!splitMappingFunctionRegEx.MatchString(t) {
-				return &mappingDestinationErr{t, ErrUnknownMappingDestinationFunction}
-			} else {
-				continue
-			}
-		}
-
-		if length == 1 && t[0] == fwc {
-			sfwc = true
-		} else if strings.ContainsAny(t, "\t\n\f\r ") {
-			return ErrInvalidMappingDestinationSubject
-		}
-	}
-	return nil
-}
-
 // Will check tokens and report back if the have any partial or full wildcards.
 func analyzeTokens(tokens []string) (hasPWC, hasFWC bool) {
 	for _, t := range tokens {
@@ -1222,18 +1181,10 @@ func SubjectsCollide(subj1, subj2 string) bool {
 	if !fwc1 && !fwc2 && len(toks1) != len(toks2) {
 		return false
 	}
-	if lt1, lt2 := len(toks1), len(toks2); lt1 != lt2 {
-		// If the shorter one only has partials then these will not collide.
-		if lt1 < lt2 && !fwc1 || lt2 < lt1 && !fwc2 {
-			return false
-		}
-	}
-
 	stop := len(toks1)
 	if len(toks2) < stop {
 		stop = len(toks2)
 	}
-
 	// We look for reasons to say no.
 	for i := 0; i < stop; i++ {
 		t1, t2 := toks1[i], toks2[i]
@@ -1241,7 +1192,6 @@ func SubjectsCollide(subj1, subj2 string) bool {
 			return false
 		}
 	}
-
 	return true
 }
 
@@ -1419,7 +1369,7 @@ func matchLiteral(literal, subject string) bool {
 }
 
 func addLocalSub(sub *subscription, subs *[]*subscription, includeLeafHubs bool) {
-	if sub != nil && sub.client != nil {
+	if sub != nil && sub.client != nil && sub.im == nil {
 		kind := sub.client.kind
 		if kind == CLIENT || kind == SYSTEM || kind == JETSTREAM || kind == ACCOUNT ||
 			(includeLeafHubs && sub.client.isHubLeafNode() /* implied kind==LEAF */) {

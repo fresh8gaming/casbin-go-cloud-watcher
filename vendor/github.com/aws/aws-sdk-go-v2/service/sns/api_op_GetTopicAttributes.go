@@ -50,47 +50,29 @@ type GetTopicAttributesOutput struct {
 	// * DisplayName – The human-readable name used in the From field for
 	// notifications to email and email-json endpoints.
 	//
-	// * EffectiveDeliveryPolicy –
-	// The JSON serialization of the effective delivery policy, taking system defaults
-	// into account.
+	// * Owner – The Amazon Web
+	// Services account ID of the topic's owner.
 	//
-	// * Owner – The Amazon Web Services account ID of the topic's
-	// owner.
+	// * Policy – The JSON serialization of
+	// the topic's access control policy.
 	//
-	// * Policy – The JSON serialization of the topic's access control
-	// policy.
+	// * SubscriptionsConfirmed – The number of
+	// confirmed subscriptions for the topic.
 	//
-	// * SignatureVersion – The version of the Amazon SNS signature used for
-	// the topic.
+	// * SubscriptionsDeleted – The number of
+	// deleted subscriptions for the topic.
 	//
-	// * By default, SignatureVersion is set to 1. The signature is a
-	// Base64-encoded SHA1withRSA signature.
+	// * SubscriptionsPending – The number of
+	// subscriptions pending confirmation for the topic.
 	//
-	// * When you set SignatureVersion to 2.
-	// Amazon SNS uses a Base64-encoded SHA256withRSA signature. If the API response
-	// does not include the SignatureVersion attribute, it means that the
-	// SignatureVersion for the topic has value 1.
+	// * TopicArn – The topic's
+	// ARN.
 	//
-	// * SubscriptionsConfirmed – The
-	// number of confirmed subscriptions for the topic.
+	// * EffectiveDeliveryPolicy – The JSON serialization of the effective
+	// delivery policy, taking system defaults into account.
 	//
-	// * SubscriptionsDeleted – The
-	// number of deleted subscriptions for the topic.
-	//
-	// * SubscriptionsPending – The
-	// number of subscriptions pending confirmation for the topic.
-	//
-	// * TopicArn – The
-	// topic's ARN.
-	//
-	// * TracingConfig – Tracing mode of an Amazon SNS topic. By default
-	// TracingConfig is set to PassThrough, and the topic passes through the tracing
-	// header it receives from an Amazon SNS publisher to its subscriptions. If set to
-	// Active, Amazon SNS will vend X-Ray segment data to topic owner account if the
-	// sampled flag in the tracing header is true. This is only supported on standard
-	// topics.
-	//
-	// The following attribute applies only to server-side-encryption
+	// The following attribute
+	// applies only to server-side-encryption
 	// (https://docs.aws.amazon.com/sns/latest/dg/sns-server-side-encryption.html):
 	//
 	// *

@@ -15,18 +15,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
 	"github.com/aws/aws-sdk-go-v2/internal/ini"
-	"github.com/aws/aws-sdk-go-v2/internal/shareddefaults"
 	"github.com/aws/smithy-go/logging"
 )
 
 const (
-	// Prefix to use for filtering profiles. The profile prefix should only
-	// exist in the shared config file, not the credentials file.
+	// Prefix to use for filtering profiles
 	profilePrefix = `profile `
-
-	// Prefix to be used for SSO sections. These are supposed to only exist in
-	// the shared config file, not the credentials file.
-	ssoSectionPrefix = `sso-session `
 
 	// string equivalent for boolean
 	endpointDiscoveryDisabled = `false`
@@ -48,13 +42,10 @@ const (
 	roleDurationSecondsKey = "duration_seconds"  // optional
 
 	// AWS Single Sign-On (AWS SSO) group
-	ssoSessionNameKey = "sso_session"
-
-	ssoRegionKey   = "sso_region"
-	ssoStartURLKey = "sso_start_url"
-
 	ssoAccountIDKey = "sso_account_id"
+	ssoRegionKey    = "sso_region"
 	ssoRoleNameKey  = "sso_role_name"
+	ssoStartURL     = "sso_start_url"
 
 	// Additional Config fields
 	regionKey = `region`
@@ -108,7 +99,7 @@ var defaultSharedConfigProfile = DefaultSharedConfigProfile
 //   - Linux/Unix: $HOME/.aws/credentials
 //   - Windows: %USERPROFILE%\.aws\credentials
 func DefaultSharedCredentialsFilename() string {
-	return filepath.Join(shareddefaults.UserHomeDir(), ".aws", "credentials")
+	return filepath.Join(userHomeDir(), ".aws", "credentials")
 }
 
 // DefaultSharedConfigFilename returns the SDK's default file path for
@@ -119,7 +110,7 @@ func DefaultSharedCredentialsFilename() string {
 //   - Linux/Unix: $HOME/.aws/config
 //   - Windows: %USERPROFILE%\.aws\config
 func DefaultSharedConfigFilename() string {
-	return filepath.Join(shareddefaults.UserHomeDir(), ".aws", "config")
+	return filepath.Join(userHomeDir(), ".aws", "config")
 }
 
 // DefaultSharedConfigFiles is a slice of the default shared config files that
@@ -128,24 +119,10 @@ var DefaultSharedConfigFiles = []string{
 	DefaultSharedConfigFilename(),
 }
 
-// DefaultSharedCredentialsFiles is a slice of the default shared credentials
-// files that the will be used in order to load the SharedConfig.
+// DefaultSharedCredentialsFiles is a slice of the default shared credentials files that
+// the will be used in order to load the SharedConfig.
 var DefaultSharedCredentialsFiles = []string{
 	DefaultSharedCredentialsFilename(),
-}
-
-// SSOSession provides the shared configuration parameters of the sso-session
-// section.
-type SSOSession struct {
-	Name        string
-	SSORegion   string
-	SSOStartURL string
-}
-
-func (s *SSOSession) setFromIniSection(section ini.Section) {
-	updateString(&s.Name, section, ssoSessionNameKey)
-	updateString(&s.SSORegion, section, ssoRegionKey)
-	updateString(&s.SSOStartURL, section, ssoStartURLKey)
 }
 
 // SharedConfig represents the configuration fields of the SDK config files.
@@ -167,17 +144,10 @@ type SharedConfig struct {
 	CredentialProcess    string
 	WebIdentityTokenFile string
 
-	// SSO session options
-	SSOSessionName string
-	SSOSession     *SSOSession
-
-	// Legacy SSO session options
-	SSORegion   string
-	SSOStartURL string
-
-	// SSO fields not used
 	SSOAccountID string
+	SSORegion    string
 	SSORoleName  string
+	SSOStartURL  string
 
 	RoleARN             string
 	ExternalID          string
@@ -493,6 +463,7 @@ type LoadSharedConfigOptions struct {
 //
 // You can read more about shared config and credentials file location at
 // https://docs.aws.amazon.com/credref/latest/refdocs/file-location.html#file-location
+//
 func LoadSharedConfigProfile(ctx context.Context, profile string, optFns ...func(*LoadSharedConfigOptions)) (SharedConfig, error) {
 	var option LoadSharedConfigOptions
 	for _, fn := range optFns {
@@ -514,7 +485,7 @@ func LoadSharedConfigProfile(ctx context.Context, profile string, optFns ...func
 	}
 
 	// check for profile prefix and drop duplicates or invalid profiles
-	err = processConfigSections(ctx, &configSections, option.Logger)
+	err = processConfigSections(ctx, configSections, option.Logger)
 	if err != nil {
 		return SharedConfig{}, err
 	}
@@ -526,12 +497,12 @@ func LoadSharedConfigProfile(ctx context.Context, profile string, optFns ...func
 	}
 
 	// check for profile prefix and drop duplicates or invalid profiles
-	err = processCredentialsSections(ctx, &credentialsSections, option.Logger)
+	err = processCredentialsSections(ctx, credentialsSections, option.Logger)
 	if err != nil {
 		return SharedConfig{}, err
 	}
 
-	err = mergeSections(&configSections, credentialsSections)
+	err = mergeSections(configSections, credentialsSections)
 	if err != nil {
 		return SharedConfig{}, err
 	}
@@ -545,73 +516,53 @@ func LoadSharedConfigProfile(ctx context.Context, profile string, optFns ...func
 	return cfg, nil
 }
 
-func processConfigSections(ctx context.Context, sections *ini.Sections, logger logging.Logger) error {
-	skipSections := map[string]struct{}{}
-
+func processConfigSections(ctx context.Context, sections ini.Sections, logger logging.Logger) error {
 	for _, section := range sections.List() {
-		if _, ok := skipSections[section]; ok {
-			continue
-		}
-
-		// drop sections from config file that do not have expected prefixes.
-		switch {
-		case strings.HasPrefix(section, profilePrefix):
-			// Rename sections to remove "profile " prefixing to match with
-			// credentials file. If default is already present, it will be
-			// dropped.
-			newName, err := renameProfileSection(section, sections, logger)
-			if err != nil {
-				return fmt.Errorf("failed to rename profile section, %w", err)
-			}
-			skipSections[newName] = struct{}{}
-
-		case strings.HasPrefix(section, ssoSectionPrefix):
-		case strings.EqualFold(section, "default"):
-		default:
+		// drop profiles without prefix for config files
+		if !strings.HasPrefix(section, profilePrefix) && !strings.EqualFold(section, "default") {
 			// drop this section, as invalid profile name
 			sections.DeleteSection(section)
 
 			if logger != nil {
-				logger.Logf(logging.Debug, "A profile defined with name `%v` is ignored. "+
-					"For use within a shared configuration file, "+
-					"a non-default profile must have `profile ` "+
-					"prefixed to the profile name.",
+				logger.Logf(logging.Debug,
+					"A profile defined with name `%v` is ignored. For use within a shared configuration file, "+
+						"a non-default profile must have `profile ` prefixed to the profile name.\n",
 					section,
 				)
 			}
 		}
 	}
+
+	// rename sections to remove `profile ` prefixing to match with credentials file.
+	// if default is already present, it will be dropped.
+	for _, section := range sections.List() {
+		if strings.HasPrefix(section, profilePrefix) {
+			v, ok := sections.GetSection(section)
+			if !ok {
+				return fmt.Errorf("error processing profiles within the shared configuration files")
+			}
+
+			// delete section with profile as prefix
+			sections.DeleteSection(section)
+
+			// set the value to non-prefixed name in sections.
+			section = strings.TrimPrefix(section, profilePrefix)
+			if sections.HasSection(section) {
+				oldSection, _ := sections.GetSection(section)
+				v.Logs = append(v.Logs,
+					fmt.Sprintf("A default profile prefixed with `profile ` found in %s, "+
+						"overrided non-prefixed default profile from %s", v.SourceFile, oldSection.SourceFile))
+			}
+
+			// assign non-prefixed name to section
+			v.Name = section
+			sections.SetSection(section, v)
+		}
+	}
 	return nil
 }
 
-func renameProfileSection(section string, sections *ini.Sections, logger logging.Logger) (string, error) {
-	v, ok := sections.GetSection(section)
-	if !ok {
-		return "", fmt.Errorf("error processing profiles within the shared configuration files")
-	}
-
-	// delete section with profile as prefix
-	sections.DeleteSection(section)
-
-	// set the value to non-prefixed name in sections.
-	section = strings.TrimPrefix(section, profilePrefix)
-	if sections.HasSection(section) {
-		oldSection, _ := sections.GetSection(section)
-		v.Logs = append(v.Logs,
-			fmt.Sprintf("A non-default profile not prefixed with `profile ` found in %s, "+
-				"overriding non-default profile from %s",
-				v.SourceFile, oldSection.SourceFile))
-		sections.DeleteSection(section)
-	}
-
-	// assign non-prefixed name to section
-	v.Name = section
-	sections.SetSection(section, v)
-
-	return section, nil
-}
-
-func processCredentialsSections(ctx context.Context, sections *ini.Sections, logger logging.Logger) error {
+func processCredentialsSections(ctx context.Context, sections ini.Sections, logger logging.Logger) error {
 	for _, section := range sections.List() {
 		// drop profiles with prefix for credential files
 		if strings.HasPrefix(section, profilePrefix) {
@@ -645,7 +596,7 @@ func loadIniFiles(filenames []string) (ini.Sections, error) {
 		}
 
 		// mergeSections into mergedSections
-		err = mergeSections(&mergedSections, sections)
+		err = mergeSections(mergedSections, sections)
 		if err != nil {
 			return ini.Sections{}, SharedConfigLoadError{Filename: filename, Err: err}
 		}
@@ -655,7 +606,7 @@ func loadIniFiles(filenames []string) (ini.Sections, error) {
 }
 
 // mergeSections merges source section properties into destination section properties
-func mergeSections(dst *ini.Sections, src ini.Sections) error {
+func mergeSections(dst, src ini.Sections) error {
 	for _, sectionName := range src.List() {
 		srcSection, _ := src.GetSection(sectionName)
 
@@ -729,13 +680,6 @@ func mergeSections(dst *ini.Sections, src ini.Sections) error {
 			useFIPSEndpointKey,
 			defaultsModeKey,
 			retryModeKey,
-			caBundleKey,
-
-			ssoSessionNameKey,
-			ssoAccountIDKey,
-			ssoRegionKey,
-			ssoRoleNameKey,
-			ssoStartURLKey,
 		}
 		for i := range stringKeys {
 			if err := mergeStringKey(&srcSection, &dstSection, sectionName, stringKeys[i]); err != nil {
@@ -754,7 +698,7 @@ func mergeSections(dst *ini.Sections, src ini.Sections) error {
 		}
 
 		// set srcSection on dst srcSection
-		*dst = dst.SetSection(sectionName, dstSection)
+		dst = dst.SetSection(sectionName, dstSection)
 	}
 
 	return nil
@@ -825,7 +769,7 @@ func (c *SharedConfig) setFromIniSections(profiles map[string]struct{}, profile 
 		}
 	}
 
-	// set config from the provided INI section
+	// set config from the provided ini section
 	err := c.setFromIniSection(profile, section)
 	if err != nil {
 		return fmt.Errorf("error fetching config from profile, %v, %w", profile, err)
@@ -838,8 +782,9 @@ func (c *SharedConfig) setFromIniSections(profiles map[string]struct{}, profile 
 		// profile only have credential provider options.
 		c.clearAssumeRoleOptions()
 	} else {
-		// First time a profile has been seen. Assert if the credential type
-		// requires a role ARN, the ARN is also set
+		// First time a profile has been seen, It must either be a assume role
+		// credentials, or SSO. Assert if the credential type requires a role ARN,
+		// the ARN is also set, or validate that the SSO configuration is complete.
 		if err := c.validateCredentialsConfig(profile); err != nil {
 			return err
 		}
@@ -887,26 +832,11 @@ func (c *SharedConfig) setFromIniSections(profiles map[string]struct{}, profile 
 		c.Source = srcCfg
 	}
 
-	// If the profile contains an SSO session parameter, the session MUST exist
-	// as a section in the config file. Load the SSO session using the name
-	// provided. If the session section is not found or incomplete an error
-	// will be returned.
-	if c.hasSSOTokenProviderConfiguration() {
-		section, ok := sections.GetSection(ssoSectionPrefix + strings.TrimSpace(c.SSOSessionName))
-		if !ok {
-			return fmt.Errorf("failed to find SSO session section, %v", c.SSOSessionName)
-		}
-		var ssoSession SSOSession
-		ssoSession.setFromIniSection(section)
-		ssoSession.Name = c.SSOSessionName
-		c.SSOSession = &ssoSession
-	}
-
 	return nil
 }
 
 // setFromIniSection loads the configuration from the profile section defined in
-// the provided INI file. A SharedConfig pointer type value is used so that
+// the provided ini file. A SharedConfig pointer type value is used so that
 // multiple config file loadings can be chained.
 //
 // Only loads complete logically grouped values, and will not set fields in cfg
@@ -941,16 +871,10 @@ func (c *SharedConfig) setFromIniSection(profile string, section ini.Section) er
 	updateString(&c.Region, section, regionKey)
 
 	// AWS Single Sign-On (AWS SSO)
-	// SSO session options
-	updateString(&c.SSOSessionName, section, ssoSessionNameKey)
-
-	// Legacy SSO session options
-	updateString(&c.SSORegion, section, ssoRegionKey)
-	updateString(&c.SSOStartURL, section, ssoStartURLKey)
-
-	// SSO fields not used
 	updateString(&c.SSOAccountID, section, ssoAccountIDKey)
+	updateString(&c.SSORegion, section, ssoRegionKey)
 	updateString(&c.SSORoleName, section, ssoRoleNameKey)
+	updateString(&c.SSOStartURL, section, ssoStartURL)
 
 	if section.Has(roleDurationSecondsKey) {
 		d := time.Duration(section.Int(roleDurationSecondsKey)) * time.Second
@@ -1068,88 +992,39 @@ func (c *SharedConfig) validateCredentialType() error {
 		len(c.CredentialProcess) != 0,
 		len(c.WebIdentityTokenFile) != 0,
 	) {
-		return fmt.Errorf("only one credential type may be specified per profile: source profile, credential source, credential process, web identity token")
+		return fmt.Errorf("only one credential type may be specified per profile: source profile, credential source, credential process, web identity token, or sso")
 	}
 
 	return nil
 }
 
 func (c *SharedConfig) validateSSOConfiguration() error {
-	if c.hasSSOTokenProviderConfiguration() {
-		err := c.validateSSOTokenProviderConfiguration()
-		if err != nil {
-			return err
-		}
+	if !c.hasSSOConfiguration() {
 		return nil
 	}
 
-	if c.hasLegacySSOConfiguration() {
-		err := c.validateLegacySSOConfiguration()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *SharedConfig) validateSSOTokenProviderConfiguration() error {
 	var missing []string
-
-	if len(c.SSOSessionName) == 0 {
-		missing = append(missing, ssoSessionNameKey)
+	if len(c.SSOAccountID) == 0 {
+		missing = append(missing, ssoAccountIDKey)
 	}
-
-	if c.SSOSession == nil {
-		missing = append(missing, ssoSectionPrefix)
-	} else {
-		if len(c.SSOSession.SSORegion) == 0 {
-			missing = append(missing, ssoRegionKey)
-		}
-
-		if len(c.SSOSession.SSOStartURL) == 0 {
-			missing = append(missing, ssoStartURLKey)
-		}
-	}
-
-	if len(missing) > 0 {
-		return fmt.Errorf("profile %q is configured to use SSO but is missing required configuration: %s",
-			c.Profile, strings.Join(missing, ", "))
-	}
-
-	if len(c.SSORegion) > 0 && c.SSORegion != c.SSOSession.SSORegion {
-		return fmt.Errorf("%s in profile %q must match %s in %s", ssoRegionKey, c.Profile, ssoRegionKey, ssoSectionPrefix)
-	}
-
-	if len(c.SSOStartURL) > 0 && c.SSOStartURL != c.SSOSession.SSOStartURL {
-		return fmt.Errorf("%s in profile %q must match %s in %s", ssoStartURLKey, c.Profile, ssoStartURLKey, ssoSectionPrefix)
-	}
-
-	return nil
-}
-
-func (c *SharedConfig) validateLegacySSOConfiguration() error {
-	var missing []string
 
 	if len(c.SSORegion) == 0 {
 		missing = append(missing, ssoRegionKey)
-	}
-
-	if len(c.SSOStartURL) == 0 {
-		missing = append(missing, ssoStartURLKey)
-	}
-
-	if len(c.SSOAccountID) == 0 {
-		missing = append(missing, ssoAccountIDKey)
 	}
 
 	if len(c.SSORoleName) == 0 {
 		missing = append(missing, ssoRoleNameKey)
 	}
 
+	if len(c.SSOStartURL) == 0 {
+		missing = append(missing, ssoStartURL)
+	}
+
 	if len(missing) > 0 {
 		return fmt.Errorf("profile %q is configured to use SSO but is missing required configuration: %s",
 			c.Profile, strings.Join(missing, ", "))
 	}
+
 	return nil
 }
 
@@ -1169,15 +1044,15 @@ func (c *SharedConfig) hasCredentials() bool {
 }
 
 func (c *SharedConfig) hasSSOConfiguration() bool {
-	return c.hasSSOTokenProviderConfiguration() || c.hasLegacySSOConfiguration()
-}
-
-func (c *SharedConfig) hasSSOTokenProviderConfiguration() bool {
-	return len(c.SSOSessionName) > 0
-}
-
-func (c *SharedConfig) hasLegacySSOConfiguration() bool {
-	return len(c.SSORegion) > 0 || len(c.SSOAccountID) > 0 || len(c.SSOStartURL) > 0 || len(c.SSORoleName) > 0
+	switch {
+	case len(c.SSOAccountID) != 0:
+	case len(c.SSORegion) != 0:
+	case len(c.SSORoleName) != 0:
+	case len(c.SSOStartURL) != 0:
+	default:
+		return false
+	}
+	return true
 }
 
 func (c *SharedConfig) clearAssumeRoleOptions() {
@@ -1266,6 +1141,12 @@ func (e CredentialRequiresARNError) Error() string {
 		"credential type %s requires role_arn, profile %s",
 		e.Type, e.Profile,
 	)
+}
+
+func userHomeDir() string {
+	// Ignore errors since we only care about Windows and *nix.
+	homedir, _ := os.UserHomeDir()
+	return homedir
 }
 
 func oneOrNone(bs ...bool) bool {

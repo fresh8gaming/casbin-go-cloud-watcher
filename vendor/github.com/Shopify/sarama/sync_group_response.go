@@ -15,7 +15,7 @@ type SyncGroupResponse struct {
 
 func (r *SyncGroupResponse) GetMemberAssignment() (*ConsumerGroupMemberAssignment, error) {
 	assignment := new(ConsumerGroupMemberAssignment)
-	err := decode(r.MemberAssignment, assignment, nil)
+	err := decode(r.MemberAssignment, assignment)
 	return assignment, err
 }
 

@@ -63,13 +63,6 @@ func TransformError(err error) error {
 		return exported.NewError(exported.CodeLockLost, err)
 	}
 
-	if isMicrosoftTimeoutError(err) {
-		// one scenario where this error pops up is if you're waiting for an available
-		// session and there are none available. It waits, up to one minute, and then
-		// returns this error.
-		return exported.NewError(exported.CodeTimeout, err)
-	}
-
 	rk := GetRecoveryKind(err)
 
 	switch rk {
@@ -84,16 +77,6 @@ func TransformError(err error) error {
 		// isn't one of our specifically called out cases so we'll just return it.
 		return err
 	}
-}
-
-func isMicrosoftTimeoutError(err error) bool {
-	var amqpErr *amqp.Error
-
-	if errors.As(err, &amqpErr) && amqpErr.Condition == amqp.ErrorCondition("com.microsoft:timeout") {
-		return true
-	}
-
-	return false
 }
 
 func IsDetachError(err error) bool {
@@ -190,9 +173,7 @@ func GetRecoveryKind(err error) RecoveryKind {
 		return RecoveryKindLink
 	}
 
-	var connErr *amqp.ConnectionError
-
-	if errors.As(err, &connErr) ||
+	if errors.Is(err, amqp.ErrConnClosed) ||
 		// session closures appear to leak through when the connection itself is going down.
 		errors.Is(err, amqp.ErrSessionClosed) {
 		return RecoveryKindConn

@@ -22,13 +22,13 @@ import (
 	"math"
 	"net/url"
 
-	pubsubpb "cloud.google.com/go/pubsub/apiv1/pubsubpb"
 	gax "github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/api/option/internaloption"
 	gtransport "google.golang.org/api/transport/grpc"
 	iampb "google.golang.org/genproto/googleapis/iam/v1"
+	pubsubpb "google.golang.org/genproto/googleapis/pubsub/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
@@ -120,8 +120,7 @@ func (c *SchemaClient) setGoogleClientInfo(keyval ...string) {
 
 // Connection returns a connection to the API service.
 //
-// Deprecated: Connections are now pooled so this method does not always
-// return the same resource.
+// Deprecated.
 func (c *SchemaClient) Connection() *grpc.ClientConn {
 	return c.internalClient.Connection()
 }
@@ -245,8 +244,7 @@ func NewSchemaClient(ctx context.Context, opts ...option.ClientOption) (*SchemaC
 
 // Connection returns a connection to the API service.
 //
-// Deprecated: Connections are now pooled so this method does not always
-// return the same resource.
+// Deprecated.
 func (c *schemaGRPCClient) Connection() *grpc.ClientConn {
 	return c.connPool.Conn()
 }

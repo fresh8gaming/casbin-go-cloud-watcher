@@ -582,7 +582,7 @@ func (c *client) processRouteInfo(info *Info) {
 		c.mu.Unlock()
 		// This is now an error and we close the connection. We need unique names for JetStream clustering.
 		c.Errorf("Remote server has a duplicate name: %q", info.Name)
-		c.closeConnection(DuplicateServerName)
+		c.closeConnection(DuplicateRoute)
 		return
 	}
 
@@ -609,7 +609,7 @@ func (c *client) processRouteInfo(info *Info) {
 		c.route.leafnodeURL = info.LeafNodeURLs[0]
 	}
 	// Compute the hash of this route based on remote server name
-	c.route.hash = getHash(info.Name)
+	c.route.hash = string(getHash(info.Name))
 	// Same with remote server ID (used for GW mapped replies routing).
 	// Use getGWHash since we don't use the same hash len for that
 	// for backward compatibility.
@@ -1289,7 +1289,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 		}
 	}
 
-	c := &client{srv: s, nc: conn, opts: ClientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r, start: time.Now()}
+	c := &client{srv: s, nc: conn, opts: ClientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r}
 
 	// Grab server variables
 	s.mu.Lock()
@@ -1305,7 +1305,6 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	authRequired := s.routeInfo.AuthRequired
 	tlsRequired := s.routeInfo.TLSRequired
 	clusterName := s.info.Cluster
-	tlsName := s.routeTLSName
 	s.mu.Unlock()
 
 	// Grab lock
@@ -1330,13 +1329,8 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 			tlsConfig = tlsConfig.Clone()
 		}
 		// Perform (server or client side) TLS handshake.
-		if resetTLSName, err := c.doTLSHandshake("route", didSolicit, rURL, tlsConfig, tlsName, opts.Cluster.TLSTimeout, opts.Cluster.TLSPinnedCerts); err != nil {
+		if _, err := c.doTLSHandshake("route", didSolicit, rURL, tlsConfig, _EMPTY_, opts.Cluster.TLSTimeout, opts.Cluster.TLSPinnedCerts); err != nil {
 			c.mu.Unlock()
-			if resetTLSName {
-				s.mu.Lock()
-				s.routeTLSName = _EMPTY_
-				s.mu.Unlock()
-			}
 			return nil
 		}
 	}
@@ -1352,7 +1346,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	}
 
 	// Set the Ping timer
-	c.setFirstPingTimer()
+	s.setFirstPingTimer(c)
 
 	// For routes, the "client" is added to s.routes only when processing
 	// the INFO protocol, that is much later.
@@ -1426,7 +1420,7 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		// check to be consistent and future proof. but will be same domain
 		if s.sameDomain(info.Domain) {
 			s.nodeToInfo.Store(c.route.hash,
-				nodeInfo{c.route.remoteName, s.info.Version, s.info.Cluster, info.Domain, id, nil, nil, nil, false, info.JetStream})
+				nodeInfo{c.route.remoteName, s.info.Version, s.info.Cluster, info.Domain, id, nil, nil, false, info.JetStream})
 		}
 		c.mu.Lock()
 		c.route.connectURLs = info.ClientConnectURLs
@@ -1614,7 +1608,7 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 		if ls, ok := lqws[key]; ok && ls == n {
 			acc.mu.Unlock()
 			return
-		} else if n > 0 {
+		} else {
 			lqws[key] = n
 		}
 		acc.mu.Unlock()
@@ -1903,22 +1897,7 @@ func (c *client) isSolicitedRoute() bool {
 	return c.kind == ROUTER && c.route != nil && c.route.didSolicit
 }
 
-// Save the first hostname found in route URLs. This will be used in gossip mode
-// when trying to create a TLS connection by setting the tlsConfig.ServerName.
-// Lock is held on entry
-func (s *Server) saveRouteTLSName(routes []*url.URL) {
-	for _, u := range routes {
-		if s.routeTLSName == _EMPTY_ && net.ParseIP(u.Hostname()) == nil {
-			s.routeTLSName = u.Hostname()
-		}
-	}
-}
-
-// Start connection process to provided routes. Each route connection will
-// be started in a dedicated go routine.
-// Lock is held on entry
 func (s *Server) solicitRoutes(routes []*url.URL) {
-	s.saveRouteTLSName(routes)
 	for _, r := range routes {
 		route := r
 		s.startGoRoutine(func() { s.connectToRoute(route, true, true) })
@@ -2047,25 +2026,4 @@ func (s *Server) removeRoute(c *client) {
 	}
 	s.removeFromTempClients(cid)
 	s.mu.Unlock()
-}
-
-func (s *Server) isDuplicateServerName(name string) bool {
-	if name == _EMPTY_ {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.info.Name == name {
-		return true
-	}
-	for _, r := range s.routes {
-		r.mu.Lock()
-		duplicate := r.route.remoteName == name
-		r.mu.Unlock()
-		if duplicate {
-			return true
-		}
-	}
-	return false
 }

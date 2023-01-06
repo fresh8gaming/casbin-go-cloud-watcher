@@ -27,6 +27,7 @@ package conf
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -71,7 +72,7 @@ func Parse(data string) (map[string]interface{}, error) {
 
 // ParseFile is a helper to open file, etc. and parse the contents.
 func ParseFile(fp string) (map[string]interface{}, error) {
-	data, err := os.ReadFile(fp)
+	data, err := ioutil.ReadFile(fp)
 	if err != nil {
 		return nil, fmt.Errorf("error opening config file: %v", err)
 	}
@@ -85,7 +86,7 @@ func ParseFile(fp string) (map[string]interface{}, error) {
 
 // ParseFileWithChecks is equivalent to ParseFile but runs in pedantic mode.
 func ParseFileWithChecks(fp string) (map[string]interface{}, error) {
-	data, err := os.ReadFile(fp)
+	data, err := ioutil.ReadFile(fp)
 	if err != nil {
 		return nil, err
 	}

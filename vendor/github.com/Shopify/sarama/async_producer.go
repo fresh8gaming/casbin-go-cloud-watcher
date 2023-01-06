@@ -10,7 +10,6 @@ import (
 
 	"github.com/eapache/go-resiliency/breaker"
 	"github.com/eapache/queue"
-	"github.com/rcrowley/go-metrics"
 )
 
 // AsyncProducer publishes Kafka messages using a non-blocking API. It routes messages
@@ -49,27 +48,65 @@ type AsyncProducer interface {
 	// you can set Producer.Return.Errors in your config to false, which prevents
 	// errors to be returned.
 	Errors() <-chan *ProducerError
+}
 
-	// IsTransactional return true when current producer is is transactional.
-	IsTransactional() bool
+// transactionManager keeps the state necessary to ensure idempotent production
+type transactionManager struct {
+	producerID      int64
+	producerEpoch   int16
+	sequenceNumbers map[string]int32
+	mutex           sync.Mutex
+}
 
-	// TxnStatus return current producer transaction status.
-	TxnStatus() ProducerTxnStatusFlag
+const (
+	noProducerID    = -1
+	noProducerEpoch = -1
+)
 
-	// BeginTxn mark current transaction as ready.
-	BeginTxn() error
+func (t *transactionManager) getAndIncrementSequenceNumber(topic string, partition int32) (int32, int16) {
+	key := fmt.Sprintf("%s-%d", topic, partition)
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	sequence := t.sequenceNumbers[key]
+	t.sequenceNumbers[key] = sequence + 1
+	return sequence, t.producerEpoch
+}
 
-	// CommitTxn commit current transaction.
-	CommitTxn() error
+func (t *transactionManager) bumpEpoch() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.producerEpoch++
+	for k := range t.sequenceNumbers {
+		t.sequenceNumbers[k] = 0
+	}
+}
 
-	// AbortTxn abort current transaction.
-	AbortTxn() error
+func (t *transactionManager) getProducerID() (int64, int16) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	return t.producerID, t.producerEpoch
+}
 
-	// AddOffsetsToTxn add associated offsets to current transaction.
-	AddOffsetsToTxn(offsets map[string][]*PartitionOffsetMetadata, groupId string) error
+func newTransactionManager(conf *Config, client Client) (*transactionManager, error) {
+	txnmgr := &transactionManager{
+		producerID:    noProducerID,
+		producerEpoch: noProducerEpoch,
+	}
 
-	// AddMessageToTxn add message offsets to current transaction.
-	AddMessageToTxn(msg *ConsumerMessage, groupId string, metadata *string) error
+	if conf.Producer.Idempotent {
+		initProducerIDResponse, err := client.InitProducerID()
+		if err != nil {
+			return nil, err
+		}
+		txnmgr.producerID = initProducerIDResponse.ProducerID
+		txnmgr.producerEpoch = initProducerIDResponse.ProducerEpoch
+		txnmgr.sequenceNumbers = make(map[string]int32)
+		txnmgr.mutex = sync.Mutex{}
+
+		Logger.Printf("Obtained a ProducerId: %d and ProducerEpoch: %d\n", txnmgr.producerID, txnmgr.producerEpoch)
+	}
+
+	return txnmgr, nil
 }
 
 type asyncProducer struct {
@@ -85,9 +122,6 @@ type asyncProducer struct {
 	brokerLock sync.Mutex
 
 	txnmgr *transactionManager
-	txLock sync.Mutex
-
-	metricsRegistry metrics.Registry
 }
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
@@ -120,16 +154,15 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 	}
 
 	p := &asyncProducer{
-		client:          client,
-		conf:            client.Config(),
-		errors:          make(chan *ProducerError),
-		input:           make(chan *ProducerMessage),
-		successes:       make(chan *ProducerMessage),
-		retries:         make(chan *ProducerMessage),
-		brokers:         make(map[*Broker]*brokerProducer),
-		brokerRefs:      make(map[*brokerProducer]int),
-		txnmgr:          txnmgr,
-		metricsRegistry: newCleanupRegistry(client.Config().MetricRegistry),
+		client:     client,
+		conf:       client.Config(),
+		errors:     make(chan *ProducerError),
+		input:      make(chan *ProducerMessage),
+		successes:  make(chan *ProducerMessage),
+		retries:    make(chan *ProducerMessage),
+		brokers:    make(map[*Broker]*brokerProducer),
+		brokerRefs: make(map[*brokerProducer]int),
+		txnmgr:     txnmgr,
 	}
 
 	// launch our singleton dispatchers
@@ -142,12 +175,9 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 type flagSet int8
 
 const (
-	syn       flagSet = 1 << iota // first message from partitionProducer to brokerProducer
-	fin                           // final message from partitionProducer to brokerProducer and back
-	shutdown                      // start the shutdown process
-	endtxn                        // endtxn
-	committxn                     // endtxn
-	aborttxn                      // endtxn
+	syn      flagSet = 1 << iota // first message from partitionProducer to brokerProducer
+	fin                          // final message from partitionProducer to brokerProducer and back
+	shutdown                     // start the shutdown process
 )
 
 // ProducerMessage is the collection of elements passed to the Producer in order to send a message.
@@ -202,7 +232,7 @@ type ProducerMessage struct {
 
 const producerMessageOverhead = 26 // the metadata overhead of CRC, flags, etc.
 
-func (m *ProducerMessage) ByteSize(version int) int {
+func (m *ProducerMessage) byteSize(version int) int {
 	var size int
 	if version >= 2 {
 		size = maximumRecordOverhead
@@ -251,97 +281,6 @@ type ProducerErrors []*ProducerError
 
 func (pe ProducerErrors) Error() string {
 	return fmt.Sprintf("kafka: Failed to deliver %d messages.", len(pe))
-}
-
-func (p *asyncProducer) IsTransactional() bool {
-	return p.txnmgr.isTransactional()
-}
-
-func (p *asyncProducer) AddMessageToTxn(msg *ConsumerMessage, groupId string, metadata *string) error {
-	offsets := make(map[string][]*PartitionOffsetMetadata)
-	offsets[msg.Topic] = []*PartitionOffsetMetadata{
-		{
-			Partition: msg.Partition,
-			Offset:    msg.Offset + 1,
-			Metadata:  metadata,
-		},
-	}
-	return p.AddOffsetsToTxn(offsets, groupId)
-}
-
-func (p *asyncProducer) AddOffsetsToTxn(offsets map[string][]*PartitionOffsetMetadata, groupId string) error {
-	p.txLock.Lock()
-	defer p.txLock.Unlock()
-
-	if !p.IsTransactional() {
-		DebugLogger.Printf("producer/txnmgr [%s] attempt to call AddOffsetsToTxn on a non-transactional producer\n", p.txnmgr.transactionalID)
-		return ErrNonTransactedProducer
-	}
-
-	DebugLogger.Printf("producer/txnmgr [%s] add offsets to transaction\n", p.txnmgr.transactionalID)
-	return p.txnmgr.addOffsetsToTxn(offsets, groupId)
-}
-
-func (p *asyncProducer) TxnStatus() ProducerTxnStatusFlag {
-	return p.txnmgr.currentTxnStatus()
-}
-
-func (p *asyncProducer) BeginTxn() error {
-	p.txLock.Lock()
-	defer p.txLock.Unlock()
-
-	if !p.IsTransactional() {
-		DebugLogger.Println("producer/txnmgr attempt to call BeginTxn on a non-transactional producer")
-		return ErrNonTransactedProducer
-	}
-
-	return p.txnmgr.transitionTo(ProducerTxnFlagInTransaction, nil)
-}
-
-func (p *asyncProducer) CommitTxn() error {
-	p.txLock.Lock()
-	defer p.txLock.Unlock()
-
-	if !p.IsTransactional() {
-		DebugLogger.Printf("producer/txnmgr [%s] attempt to call CommitTxn on a non-transactional producer\n", p.txnmgr.transactionalID)
-		return ErrNonTransactedProducer
-	}
-
-	DebugLogger.Printf("producer/txnmgr [%s] committing transaction\n", p.txnmgr.transactionalID)
-	err := p.finishTransaction(true)
-	if err != nil {
-		return err
-	}
-	DebugLogger.Printf("producer/txnmgr [%s] transaction committed\n", p.txnmgr.transactionalID)
-	return nil
-}
-
-func (p *asyncProducer) AbortTxn() error {
-	p.txLock.Lock()
-	defer p.txLock.Unlock()
-
-	if !p.IsTransactional() {
-		DebugLogger.Printf("producer/txnmgr [%s] attempt to call AbortTxn on a non-transactional producer\n", p.txnmgr.transactionalID)
-		return ErrNonTransactedProducer
-	}
-	DebugLogger.Printf("producer/txnmgr [%s] aborting transaction\n", p.txnmgr.transactionalID)
-	err := p.finishTransaction(false)
-	if err != nil {
-		return err
-	}
-	DebugLogger.Printf("producer/txnmgr [%s] transaction aborted\n", p.txnmgr.transactionalID)
-	return nil
-}
-
-func (p *asyncProducer) finishTransaction(commit bool) error {
-	p.inFlight.Add(1)
-	if commit {
-		p.input <- &ProducerMessage{flags: endtxn | committxn}
-	} else {
-		p.input <- &ProducerMessage{flags: endtxn | aborttxn}
-	}
-	p.inFlight.Wait()
-	return p.txnmgr.finishTransaction(commit)
 }
 
 func (p *asyncProducer) Errors() <-chan *ProducerError {
@@ -397,27 +336,11 @@ func (p *asyncProducer) dispatcher() {
 			continue
 		}
 
-		if msg.flags&endtxn != 0 {
-			var err error
-			if msg.flags&committxn != 0 {
-				err = p.txnmgr.transitionTo(ProducerTxnFlagEndTransaction|ProducerTxnFlagCommittingTransaction, nil)
-			} else {
-				err = p.txnmgr.transitionTo(ProducerTxnFlagEndTransaction|ProducerTxnFlagAbortingTransaction, nil)
-			}
-			if err != nil {
-				Logger.Printf("producer/txnmgr unable to end transaction %s", err)
-			}
-			p.inFlight.Done()
-			continue
-		}
-
 		if msg.flags&shutdown != 0 {
 			shuttingDown = true
 			p.inFlight.Done()
 			continue
-		}
-
-		if msg.retries == 0 {
+		} else if msg.retries == 0 {
 			if shuttingDown {
 				// we can't just call returnError here because that decrements the wait group,
 				// which hasn't been incremented yet for this message, and shouldn't be
@@ -430,13 +353,6 @@ func (p *asyncProducer) dispatcher() {
 				continue
 			}
 			p.inFlight.Add(1)
-			// Ignore retried msg, there are already in txn.
-			// Can't produce new record when transaction is not started.
-			if p.IsTransactional() && p.txnmgr.currentTxnStatus()&ProducerTxnFlagInTransaction == 0 {
-				Logger.Printf("attempt to send message when transaction is not started or is in ending state, got %d, expect %d\n", p.txnmgr.currentTxnStatus(), ProducerTxnFlagInTransaction)
-				p.returnError(msg, ErrTransactionNotReady)
-				continue
-			}
 		}
 
 		for _, interceptor := range p.conf.Producer.Interceptors {
@@ -450,7 +366,7 @@ func (p *asyncProducer) dispatcher() {
 			p.returnError(msg, ConfigurationError("Producing headers requires Kafka at least v0.11"))
 			continue
 		}
-		if msg.ByteSize(version) > p.conf.Producer.MaxMessageBytes {
+		if msg.byteSize(version) > p.conf.Producer.MaxMessageBytes {
 			p.returnError(msg, ErrMessageSizeTooLarge)
 			continue
 		}
@@ -689,10 +605,6 @@ func (pp *partitionProducer) dispatch() {
 			msg.hasSequence = true
 		}
 
-		if pp.parent.IsTransactional() {
-			pp.parent.txnmgr.maybeAddPartitionToCurrentTxn(pp.topic, pp.partition)
-		}
-
 		pp.brokerProducer.input <- msg
 	}
 }
@@ -803,16 +715,6 @@ func (p *asyncProducer) newBrokerProducer(broker *Broker) *brokerProducer {
 				}
 			}(set)
 
-			if p.IsTransactional() {
-				// Add partition to tx before sending current batch
-				err := p.txnmgr.publishTxnPartitions()
-				if err != nil {
-					// Request failed to be sent
-					sendResponse(nil, err)
-					continue
-				}
-			}
-
 			// Use AsyncProduce vs Produce to not block waiting for the response
 			// so that we can pipeline multiple produce requests and achieve higher throughput, see:
 			// https://kafka.apache.org/protocol#protocol_network
@@ -891,7 +793,7 @@ type brokerProducer struct {
 	abandoned chan struct{}
 
 	buffer     *produceSet
-	timer      *time.Timer
+	timer      <-chan time.Time
 	timerFired bool
 
 	closing        error
@@ -900,7 +802,6 @@ type brokerProducer struct {
 
 func (bp *brokerProducer) run() {
 	var output chan<- *produceSet
-	var timerChan <-chan time.Time
 	Logger.Printf("producer/broker/%d starting up\n", bp.broker.ID())
 
 	for {
@@ -970,14 +871,12 @@ func (bp *brokerProducer) run() {
 			}
 
 			if bp.parent.conf.Producer.Flush.Frequency > 0 && bp.timer == nil {
-				bp.timer = time.NewTimer(bp.parent.conf.Producer.Flush.Frequency)
-				timerChan = bp.timer.C
+				bp.timer = time.After(bp.parent.conf.Producer.Flush.Frequency)
 			}
-		case <-timerChan:
+		case <-bp.timer:
 			bp.timerFired = true
 		case output <- bp.buffer:
 			bp.rollOver()
-			timerChan = nil
 		case response, ok := <-bp.responses:
 			if ok {
 				bp.handleResponse(response)
@@ -1037,9 +936,6 @@ func (bp *brokerProducer) waitForSpace(msg *ProducerMessage, forceRollover bool)
 }
 
 func (bp *brokerProducer) rollOver() {
-	if bp.timer != nil {
-		bp.timer.Stop()
-	}
 	bp.timer = nil
 	bp.timerFired = false
 	bp.buffer = newProduceSet(bp.parent)
@@ -1238,8 +1134,6 @@ func (p *asyncProducer) shutdown() {
 	close(p.retries)
 	close(p.errors)
 	close(p.successes)
-
-	p.metricsRegistry.UnregisterAll()
 }
 
 func (p *asyncProducer) bumpIdempotentProducerEpoch() {
@@ -1258,26 +1152,10 @@ func (p *asyncProducer) bumpIdempotentProducerEpoch() {
 	}
 }
 
-func (p *asyncProducer) maybeTransitionToErrorState(err error) error {
-	if errors.Is(err, ErrClusterAuthorizationFailed) ||
-		errors.Is(err, ErrProducerFenced) ||
-		errors.Is(err, ErrUnsupportedVersion) ||
-		errors.Is(err, ErrTransactionalIDAuthorizationFailed) {
-		return p.txnmgr.transitionTo(ProducerTxnFlagInError|ProducerTxnFlagFatalError, err)
-	}
-	if p.txnmgr.coordinatorSupportsBumpingEpoch && p.txnmgr.currentTxnStatus()&ProducerTxnFlagEndTransaction == 0 {
-		p.txnmgr.epochBumpRequired = true
-	}
-	return p.txnmgr.transitionTo(ProducerTxnFlagInError|ProducerTxnFlagAbortableError, err)
-}
-
 func (p *asyncProducer) returnError(msg *ProducerMessage, err error) {
-	if p.IsTransactional() {
-		_ = p.maybeTransitionToErrorState(err)
-	}
 	// We need to reset the producer ID epoch if we set a sequence number on it, because the broker
 	// will never see a message with this number, so we can never continue the sequence.
-	if !p.IsTransactional() && msg.hasSequence {
+	if msg.hasSequence {
 		Logger.Printf("producer/txnmanager rolling over epoch due to publish failure on %s/%d", msg.Topic, msg.Partition)
 		p.bumpIdempotentProducerEpoch()
 	}

@@ -61,20 +61,7 @@ type CreateTopicInput struct {
 	// topic. By default, only the topic owner can publish or subscribe to the
 	// topic.
 	//
-	// * SignatureVersion – The signature version corresponds to the hashing
-	// algorithm used while creating the signature of the notifications, subscription
-	// confirmations, or unsubscribe confirmation messages sent by Amazon SNS. By
-	// default, SignatureVersion is set to 1.
-	//
-	// * TracingConfig – Tracing mode of an
-	// Amazon SNS topic. By default TracingConfig is set to PassThrough, and the topic
-	// passes through the tracing header it receives from an Amazon SNS publisher to
-	// its subscriptions. If set to Active, Amazon SNS will vend X-Ray segment data to
-	// topic owner account if the sampled flag in the tracing header is true. This is
-	// only supported on standard topics.
-	//
-	// The following attribute applies only to
-	// server-side encryption
+	// The following attribute applies only to server-side encryption
 	// (https://docs.aws.amazon.com/sns/latest/dg/sns-server-side-encryption.html):
 	//
 	// *
@@ -107,11 +94,6 @@ type CreateTopicInput struct {
 	// attributes of the message). (Optional) To override the generated value, you can
 	// specify a value for the MessageDeduplicationId parameter for the Publish action.
 	Attributes map[string]string
-
-	// The body of the policy document you want to use for this topic. You can only add
-	// one policy per topic. The policy must be in JSON string format. Length
-	// Constraints: Maximum length of 30,720.
-	DataProtectionPolicy *string
 
 	// The list of tags to add to a new topic. To be able to tag a topic on creation,
 	// you must have the sns:CreateTopic and sns:TagResource permissions.

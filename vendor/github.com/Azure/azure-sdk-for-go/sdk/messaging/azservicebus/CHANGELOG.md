@@ -1,67 +1,11 @@
 # Release History
 
-## 1.1.3 (2022-11-16)
+## 1.0.2 (2022-07-07)
 
 ### Bugs Fixed
 
-- Removing changes for client-side idle timer and closing without timeout. Combined these are 
-  causing issues with links not properly recovering or closing. Investigating an alternative
-  for a future release.
-
-## 1.1.2 (2022-11-08)
-
-### Features Added
-
-- Added a client-side idle timer which will reset Receiver links, transparently, if the link is idle for 
-  5 minutes.
-
-### Bugs Fixed
-
-- $cbs link is properly closed, even on cancellation (#19492)
-
-## 1.1.1 (2022-10-11)
-
-### Bugs Fixed
-
-- AcceptNextSessionForQueue and AcceptNextSessionForSubscription now return an azservicebus.Error with 
-  Code set to CodeTimeout when they fail due to no sessions being available. Examples for this have 
-  been added for `AcceptNextSessionForQueue`. PR#19113.
-- Retries now respect cancellation when they're in the "delay before next try" phase.
-
-## 1.1.0 (2022-08-09)
-
-### Features Added
-
-- Full access to send and receive all AMQP message properties. (#18413) 
-  - Send AMQP messages using the new `AMQPAnnotatedMessage` type and `Sender.SendAMQPAnnotatedMessage()`.
-  - AMQP messages can be added to MessageBatch's as well using `MessageBatch.AddAMQPAnnotatedMessage()`.
-  - AMQP messages can be scheduled using `Sender.ScheduleAMQPAnnotatedMessages`.
-  - Access the full set of AMQP message properties when receiving using the `ReceivedMessage.RawAMQPMessage` property. 
-
-### Bugs Fixed
-
-- Changed receive messages algorithm to avoid messages being excessively locked in Service Bus without 
-  being transferred to the client. (PR#18657)
-- Updating go-amqp, which fixes several bugs related to incorrect message locking (PR#18599)
-  - Requesting large quantities of messages in a single ReceiveMessages() call could result in messages 
-    not being delivered, but still incrementing their delivery count and requiring the message lock 
-    timeout to expire.
-  - Link detach could result in messages being ignored, requiring the message lock timeout to expire.
-- Subscription rules weren't deserializing properly when created from the portal (PR#18813)
-
-## 1.0.2-beta.0 (2022-07-07)
-
-### Features Added
-
-- Full access to send and receive all AMQP message properties. (#18413) 
-  - Send AMQP messages using the new `AMQPAnnotatedMessage` type and `Sender.SendAMQPAnnotatedMessage()`.
-  - AMQP messages can be added to MessageBatch's as well using `MessageBatch.AddAMQPAnnotatedMessage()`.
-  - AMQP messages can be scheduled using `Sender.ScheduleAMQPAnnotatedMessages`.
-  - Access the full set of AMQP message properties when receiving using the `ReceivedMessage.RawAMQPMessage` property. 
-
-### Bugs Fixed
-
-- Settlement of a message could hang if the link had been detached/closed. (#18532)
+- Settlement of a message could hang if the link had been detached/closed. (#18530)
+- Cancelling link creation could leak a goroutine or, in rare conditions, a link. (#18479)
 
 ## 1.0.1 (2022-06-07)
 

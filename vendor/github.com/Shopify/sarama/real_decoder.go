@@ -3,8 +3,6 @@ package sarama
 import (
 	"encoding/binary"
 	"math"
-
-	"github.com/rcrowley/go-metrics"
 )
 
 var (
@@ -17,10 +15,9 @@ var (
 )
 
 type realDecoder struct {
-	raw      []byte
-	off      int
-	stack    []pushDecoder
-	registry metrics.Registry
+	raw   []byte
+	off   int
+	stack []pushDecoder
 }
 
 // primitives
@@ -461,8 +458,4 @@ func (rd *realDecoder) pop() error {
 	rd.stack = rd.stack[:len(rd.stack)-1]
 
 	return in.check(rd.off, rd.raw)
-}
-
-func (rd *realDecoder) metricRegistry() metrics.Registry {
-	return rd.registry
 }

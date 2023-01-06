@@ -14,7 +14,6 @@
 package server
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 )
 
@@ -42,6 +41,6 @@ func (s *Server) nonceRequired() bool {
 func (s *Server) generateNonce(n []byte) {
 	var raw [nonceRawLen]byte
 	data := raw[:]
-	rand.Read(data)
+	s.prand.Read(data)
 	base64.RawURLEncoding.Encode(n, data)
 }

@@ -256,22 +256,9 @@ func (mor *MockOffsetResponse) getOffset(topic string, partition int32, time int
 	return offset
 }
 
-// mockMessage is a message that used to be mocked for `FetchResponse`
-type mockMessage struct {
-	key Encoder
-	msg Encoder
-}
-
-func newMockMessage(key, msg Encoder) *mockMessage {
-	return &mockMessage{
-		key: key,
-		msg: msg,
-	}
-}
-
 // MockFetchResponse is a `FetchResponse` builder.
 type MockFetchResponse struct {
-	messages       map[string]map[int32]map[int64]*mockMessage
+	messages       map[string]map[int32]map[int64]Encoder
 	messagesLock   *sync.RWMutex
 	highWaterMarks map[string]map[int32]int64
 	t              TestReporter
@@ -280,7 +267,7 @@ type MockFetchResponse struct {
 
 func NewMockFetchResponse(t TestReporter, batchSize int) *MockFetchResponse {
 	return &MockFetchResponse{
-		messages:       make(map[string]map[int32]map[int64]*mockMessage),
+		messages:       make(map[string]map[int32]map[int64]Encoder),
 		messagesLock:   &sync.RWMutex{},
 		highWaterMarks: make(map[string]map[int32]int64),
 		t:              t,
@@ -289,23 +276,19 @@ func NewMockFetchResponse(t TestReporter, batchSize int) *MockFetchResponse {
 }
 
 func (mfr *MockFetchResponse) SetMessage(topic string, partition int32, offset int64, msg Encoder) *MockFetchResponse {
-	return mfr.SetMessageWithKey(topic, partition, offset, nil, msg)
-}
-
-func (mfr *MockFetchResponse) SetMessageWithKey(topic string, partition int32, offset int64, key, msg Encoder) *MockFetchResponse {
 	mfr.messagesLock.Lock()
 	defer mfr.messagesLock.Unlock()
 	partitions := mfr.messages[topic]
 	if partitions == nil {
-		partitions = make(map[int32]map[int64]*mockMessage)
+		partitions = make(map[int32]map[int64]Encoder)
 		mfr.messages[topic] = partitions
 	}
 	messages := partitions[partition]
 	if messages == nil {
-		messages = make(map[int64]*mockMessage)
+		messages = make(map[int64]Encoder)
 		partitions[partition] = messages
 	}
-	messages[offset] = newMockMessage(key, msg)
+	messages[offset] = msg
 	return mfr
 }
 
@@ -332,7 +315,7 @@ func (mfr *MockFetchResponse) For(reqBody versionedDecoder) encoderWithHeader {
 			for i := 0; i < mfr.batchSize && offset < maxOffset; {
 				msg := mfr.getMessage(topic, partition, offset)
 				if msg != nil {
-					res.AddMessage(topic, partition, msg.key, msg.msg, offset)
+					res.AddMessage(topic, partition, nil, msg, offset)
 					i++
 				}
 				offset++
@@ -348,7 +331,7 @@ func (mfr *MockFetchResponse) For(reqBody versionedDecoder) encoderWithHeader {
 	return res
 }
 
-func (mfr *MockFetchResponse) getMessage(topic string, partition int32, offset int64) *mockMessage {
+func (mfr *MockFetchResponse) getMessage(topic string, partition int32, offset int64) Encoder {
 	mfr.messagesLock.RLock()
 	defer mfr.messagesLock.RUnlock()
 	partitions := mfr.messages[topic]
@@ -459,7 +442,6 @@ func (mr *MockFindCoordinatorResponse) SetError(coordinatorType CoordinatorType,
 func (mr *MockFindCoordinatorResponse) For(reqBody versionedDecoder) encoderWithHeader {
 	req := reqBody.(*FindCoordinatorRequest)
 	res := &FindCoordinatorResponse{}
-	res.Version = req.Version
 	var v interface{}
 	switch req.CoordinatorType {
 	case CoordinatorGroup:

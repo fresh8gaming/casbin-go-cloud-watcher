@@ -217,21 +217,17 @@ func (e *ExpiryPolicy) String() string {
 // Sender Settlement Modes
 const (
 	// Sender will send all deliveries initially unsettled to the receiver.
-	SenderSettleModeUnsettled SenderSettleMode = 0
+	ModeUnsettled SenderSettleMode = 0
 
 	// Sender will send all deliveries settled to the receiver.
-	SenderSettleModeSettled SenderSettleMode = 1
+	ModeSettled SenderSettleMode = 1
 
 	// Sender MAY send a mixture of settled and unsettled deliveries to the receiver.
-	SenderSettleModeMixed SenderSettleMode = 2
+	ModeMixed SenderSettleMode = 2
 )
 
 // SenderSettleMode specifies how the sender will settle messages.
 type SenderSettleMode uint8
-
-func (m SenderSettleMode) Ptr() *SenderSettleMode {
-	return &m
-}
 
 func (m *SenderSettleMode) String() string {
 	if m == nil {
@@ -239,13 +235,13 @@ func (m *SenderSettleMode) String() string {
 	}
 
 	switch *m {
-	case SenderSettleModeUnsettled:
+	case ModeUnsettled:
 		return "unsettled"
 
-	case SenderSettleModeSettled:
+	case ModeSettled:
 		return "settled"
 
-	case SenderSettleModeMixed:
+	case ModeMixed:
 		return "mixed"
 
 	default:
@@ -266,20 +262,16 @@ func (m *SenderSettleMode) Unmarshal(r *buffer.Buffer) error {
 // Receiver Settlement Modes
 const (
 	// Receiver will spontaneously settle all incoming transfers.
-	ReceiverSettleModeFirst ReceiverSettleMode = 0
+	ModeFirst ReceiverSettleMode = 0
 
 	// Receiver will only settle after sending the disposition to the
 	// sender and receiving a disposition indicating settlement of
 	// the delivery from the sender.
-	ReceiverSettleModeSecond ReceiverSettleMode = 1
+	ModeSecond ReceiverSettleMode = 1
 )
 
 // ReceiverSettleMode specifies how the receiver will settle messages.
 type ReceiverSettleMode uint8
-
-func (m ReceiverSettleMode) Ptr() *ReceiverSettleMode {
-	return &m
-}
 
 func (m *ReceiverSettleMode) String() string {
 	if m == nil {
@@ -287,10 +279,10 @@ func (m *ReceiverSettleMode) String() string {
 	}
 
 	switch *m {
-	case ReceiverSettleModeFirst:
+	case ModeFirst:
 		return "first"
 
-	case ReceiverSettleModeSecond:
+	case ModeSecond:
 		return "second"
 
 	default:
@@ -463,7 +455,7 @@ func tryReadNull(r *buffer.Buffer) bool {
 // Annotations keys must be of type string, int, or int64.
 //
 // String keys are encoded as AMQP Symbols.
-type Annotations map[any]any
+type Annotations map[interface{}]interface{}
 
 func (a Annotations) Marshal(wr *buffer.Buffer) error {
 	return writeMap(wr, a)
@@ -491,16 +483,16 @@ func (a *Annotations) Unmarshal(r *buffer.Buffer) error {
 	return nil
 }
 
-// ErrCond is one of the error conditions defined in the AMQP spec.
-type ErrCond string
+// ErrorCondition is one of the error conditions defined in the AMQP spec.
+type ErrorCondition string
 
-func (ec ErrCond) Marshal(wr *buffer.Buffer) error {
+func (ec ErrorCondition) Marshal(wr *buffer.Buffer) error {
 	return (Symbol)(ec).Marshal(wr)
 }
 
-func (ec *ErrCond) Unmarshal(r *buffer.Buffer) error {
+func (ec *ErrorCondition) Unmarshal(r *buffer.Buffer) error {
 	s, err := ReadString(r)
-	*ec = ErrCond(s)
+	*ec = ErrorCondition(s)
 	return err
 }
 
@@ -516,7 +508,7 @@ func (ec *ErrCond) Unmarshal(r *buffer.Buffer) error {
 // Error is an AMQP error.
 type Error struct {
 	// A symbolic value indicating the error condition.
-	Condition ErrCond
+	Condition ErrorCondition
 
 	// descriptive text about the error condition
 	//
@@ -525,7 +517,7 @@ type Error struct {
 	Description string
 
 	// map carrying information about the error condition
-	Info map[string]any
+	Info map[string]interface{}
 }
 
 func (e *Error) Marshal(wr *buffer.Buffer) error {
@@ -775,10 +767,10 @@ func (m *Milliseconds) Unmarshal(r *buffer.Buffer) error {
 
 // mapAnyAny is used to decode AMQP maps who's keys are undefined or
 // inconsistently typed.
-type mapAnyAny map[any]any
+type mapAnyAny map[interface{}]interface{}
 
 func (m mapAnyAny) Marshal(wr *buffer.Buffer) error {
-	return writeMap(wr, map[any]any(m))
+	return writeMap(wr, map[interface{}]interface{}(m))
 }
 
 func (m *mapAnyAny) Unmarshal(r *buffer.Buffer) error {
@@ -814,10 +806,10 @@ func (m *mapAnyAny) Unmarshal(r *buffer.Buffer) error {
 }
 
 // mapStringAny is used to decode AMQP maps that have string keys
-type mapStringAny map[string]any
+type mapStringAny map[string]interface{}
 
 func (m mapStringAny) Marshal(wr *buffer.Buffer) error {
-	return writeMap(wr, map[string]any(m))
+	return writeMap(wr, map[string]interface{}(m))
 }
 
 func (m *mapStringAny) Unmarshal(r *buffer.Buffer) error {
@@ -844,10 +836,10 @@ func (m *mapStringAny) Unmarshal(r *buffer.Buffer) error {
 }
 
 // mapStringAny is used to decode AMQP maps that have Symbol keys
-type mapSymbolAny map[Symbol]any
+type mapSymbolAny map[Symbol]interface{}
 
 func (m mapSymbolAny) Marshal(wr *buffer.Buffer) error {
-	return writeMap(wr, map[Symbol]any(m))
+	return writeMap(wr, map[Symbol]interface{}(m))
 }
 
 func (m *mapSymbolAny) Unmarshal(r *buffer.Buffer) error {
@@ -934,8 +926,8 @@ func (p *LifetimePolicy) Unmarshal(r *buffer.Buffer) error {
 }
 
 type DescribedType struct {
-	Descriptor any
-	Value      any
+	Descriptor interface{}
+	Value      interface{}
 }
 
 func (t DescribedType) Marshal(wr *buffer.Buffer) error {
@@ -2064,7 +2056,7 @@ func (a *arrayUUID) Unmarshal(r *buffer.Buffer) error {
 
 // LIST
 
-type list []any
+type list []interface{}
 
 func (l list) Marshal(wr *buffer.Buffer) error {
 	length := len(l)
@@ -2109,7 +2101,7 @@ func (l *list) Unmarshal(r *buffer.Buffer) error {
 
 	ll := *l
 	if int64(cap(ll)) < length {
-		ll = make([]any, length)
+		ll = make([]interface{}, length)
 	} else {
 		ll = ll[:length]
 	}

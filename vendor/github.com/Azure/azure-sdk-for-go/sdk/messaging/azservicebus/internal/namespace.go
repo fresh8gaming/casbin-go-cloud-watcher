@@ -159,20 +159,22 @@ func NewNamespace(opts ...NamespaceOption) (*Namespace, error) {
 }
 
 func (ns *Namespace) newClientImpl(ctx context.Context) (amqpwrap.AMQPClient, error) {
-	connOptions := amqp.ConnOptions{
-		SASLType:    amqp.SASLTypeAnonymous(),
-		MaxSessions: 65535,
-		Properties: map[string]interface{}{
-			"product":    "MSGolangClient",
-			"version":    Version,
-			"platform":   runtime.GOOS,
-			"framework":  runtime.Version(),
-			"user-agent": ns.getUserAgent(),
-		},
+	defaultConnOptions := []amqp.ConnOption{
+		amqp.ConnSASLAnonymous(),
+		amqp.ConnMaxSessions(65535),
+		amqp.ConnProperty("product", "MSGolangClient"),
+		amqp.ConnProperty("version", Version),
+		amqp.ConnProperty("platform", runtime.GOOS),
+		amqp.ConnProperty("framework", runtime.Version()),
+		amqp.ConnProperty("user-agent", ns.getUserAgent()),
 	}
 
 	if ns.tlsConfig != nil {
-		connOptions.TLSConfig = ns.tlsConfig
+		defaultConnOptions = append(
+			defaultConnOptions,
+			amqp.ConnTLS(true),
+			amqp.ConnTLSConfig(ns.tlsConfig),
+		)
 	}
 
 	if ns.newWebSocketConn != nil {
@@ -184,12 +186,11 @@ func (ns *Namespace) newClientImpl(ctx context.Context) (amqpwrap.AMQPClient, er
 			return nil, err
 		}
 
-		connOptions.HostName = ns.FQDN
-		client, err := amqp.New(nConn, &connOptions)
+		client, err := amqp.New(nConn, append(defaultConnOptions, amqp.ConnServerHostname(ns.FQDN))...)
 		return &amqpwrap.AMQPClientWrapper{Inner: client}, err
 	}
 
-	client, err := amqp.Dial(ns.getAMQPHostURI(), &connOptions)
+	client, err := amqp.Dial(ns.getAMQPHostURI(), defaultConnOptions...)
 	return &amqpwrap.AMQPClientWrapper{Inner: client}, err
 }
 
@@ -202,7 +203,7 @@ func (ns *Namespace) NewAMQPSession(ctx context.Context) (amqpwrap.AMQPSession, 
 		return nil, 0, err
 	}
 
-	session, err := client.NewSession(ctx, nil)
+	session, err := client.NewSession()
 
 	if err != nil {
 		return nil, 0, err
@@ -219,7 +220,7 @@ func (ns *Namespace) NewRPCLink(ctx context.Context, managementPath string) (RPC
 		return nil, err
 	}
 
-	return NewRPCLink(ctx, RPCLinkArgs{
+	return NewRPCLink(RPCLinkArgs{
 		Client:   client,
 		Address:  managementPath,
 		LogEvent: exported.EventReceiver,
@@ -454,7 +455,6 @@ func (ns *Namespace) updateClientWithoutLock(ctx context.Context) (amqpwrap.AMQP
 		return ns.client, ns.connID, nil
 	}
 
-	connStart := time.Now()
 	log.Writef(exported.EventConn, "Creating new client, current rev: %d", ns.connID)
 	tempClient, err := ns.newClientFn(ctx)
 
@@ -464,7 +464,7 @@ func (ns *Namespace) updateClientWithoutLock(ctx context.Context) (amqpwrap.AMQP
 
 	ns.connID++
 	ns.client = tempClient
-	log.Writef(exported.EventConn, "Client created, new rev: %d, took %dms", ns.connID, time.Since(connStart)/time.Millisecond)
+	log.Writef(exported.EventConn, "Client created, new rev: %d", ns.connID)
 
 	return ns.client, ns.connID, err
 }

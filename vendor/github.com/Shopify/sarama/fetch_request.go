@@ -95,8 +95,6 @@ const (
 )
 
 func (r *FetchRequest) encode(pe packetEncoder) (err error) {
-	metricRegistry := pe.metricRegistry()
-
 	pe.putInt32(-1) // ReplicaID is always -1 for clients
 	pe.putInt32(r.MaxWaitTime)
 	pe.putInt32(r.MinBytes)
@@ -130,7 +128,6 @@ func (r *FetchRequest) encode(pe packetEncoder) (err error) {
 				return err
 			}
 		}
-		getOrRegisterTopicMeter("consumer-fetch-rate", topic, metricRegistry).Mark(1)
 	}
 	if r.Version >= 7 {
 		err = pe.putArrayLength(len(r.forgotten))

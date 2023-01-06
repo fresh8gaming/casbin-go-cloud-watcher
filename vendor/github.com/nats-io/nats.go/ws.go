@@ -1,4 +1,4 @@
-// Copyright 2021-2022 The NATS Authors
+// Copyright 2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	mrand "math/rand"
 	"net/http"
 	"net/url"
@@ -169,7 +170,8 @@ func (d *wsDecompressor) decompress() ([]byte, error) {
 	} else {
 		d.flate.(flate.Resetter).Reset(d, nil)
 	}
-	b, err := io.ReadAll(d.flate)
+	// TODO: When Go 1.15 support is dropped, replace with io.ReadAll()
+	b, err := ioutil.ReadAll(d.flate)
 	// Now reset the compressed buffers list
 	d.bufs = nil
 	return b, err

@@ -17,9 +17,7 @@ package pubsub
 // PublisherProjectPath returns the path for the project resource.
 //
 // Deprecated: Use
-//
-//	fmt.Sprintf("projects/%s", project)
-//
+//   fmt.Sprintf("projects/%s", project)
 // instead.
 func PublisherProjectPath(project string) string {
 	return "" +
@@ -31,9 +29,7 @@ func PublisherProjectPath(project string) string {
 // PublisherTopicPath returns the path for the topic resource.
 //
 // Deprecated: Use
-//
-//	fmt.Sprintf("projects/%s/topics/%s", project, topic)
-//
+//   fmt.Sprintf("projects/%s/topics/%s", project, topic)
 // instead.
 func PublisherTopicPath(project, topic string) string {
 	return "" +
@@ -47,9 +43,7 @@ func PublisherTopicPath(project, topic string) string {
 // SubscriberProjectPath returns the path for the project resource.
 //
 // Deprecated: Use
-//
-//	fmt.Sprintf("projects/%s", project)
-//
+//   fmt.Sprintf("projects/%s", project)
 // instead.
 func SubscriberProjectPath(project string) string {
 	return "" +
@@ -61,9 +55,7 @@ func SubscriberProjectPath(project string) string {
 // SubscriberSnapshotPath returns the path for the snapshot resource.
 //
 // Deprecated: Use
-//
-//	fmt.Sprintf("projects/%s/snapshots/%s", project, snapshot)
-//
+//   fmt.Sprintf("projects/%s/snapshots/%s", project, snapshot)
 // instead.
 func SubscriberSnapshotPath(project, snapshot string) string {
 	return "" +
@@ -77,9 +69,7 @@ func SubscriberSnapshotPath(project, snapshot string) string {
 // SubscriberSubscriptionPath returns the path for the subscription resource.
 //
 // Deprecated: Use
-//
-//	fmt.Sprintf("projects/%s/subscriptions/%s", project, subscription)
-//
+//   fmt.Sprintf("projects/%s/subscriptions/%s", project, subscription)
 // instead.
 func SubscriberSubscriptionPath(project, subscription string) string {
 	return "" +
@@ -93,9 +83,7 @@ func SubscriberSubscriptionPath(project, subscription string) string {
 // SubscriberTopicPath returns the path for the topic resource.
 //
 // Deprecated: Use
-//
-//	fmt.Sprintf("projects/%s/topics/%s", project, topic)
-//
+//   fmt.Sprintf("projects/%s/topics/%s", project, topic)
 // instead.
 func SubscriberTopicPath(project, topic string) string {
 	return "" +

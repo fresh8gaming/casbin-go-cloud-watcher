@@ -33,7 +33,7 @@ type FakeAMQPSender struct {
 type FakeAMQPSession struct {
 	amqpwrap.AMQPSession
 
-	NewReceiverFn func(ctx context.Context, source string, opts *amqp.ReceiverOptions) (AMQPReceiverCloser, error)
+	NewReceiverFn func(opts ...amqp.LinkOption) (AMQPReceiverCloser, error)
 
 	closed int
 }
@@ -61,26 +61,25 @@ type FakeAMQPReceiver struct {
 	Closed  int
 	CloseFn func(ctx context.Context) error
 
-	CreditsCalled int
-	CreditsImpl   func() uint32
+	DrainCalled     int
+	DrainCreditImpl func(ctx context.Context) error
 
 	IssueCreditErr   error
 	RequestedCredits uint32
 
 	PrefetchedCalled int
-
-	ReceiveCalled int
-	ReceiveFn     func(ctx context.Context) (*amqp.Message, error)
-
-	ReleaseMessageCalled int
-	ReleaseMessageFn     func(ctx context.Context, msg *amqp.Message) error
+	ReceiveCalled    int
+	ReceiveFn        func(ctx context.Context) (*amqp.Message, error)
 
 	ReceiveResults []struct {
 		M *amqp.Message
 		E error
 	}
 
-	PrefetchedResults []*amqp.Message
+	PrefetchResults []struct {
+		M *amqp.Message
+		E error
+	}
 }
 
 type FakeRPCLink struct {
@@ -110,27 +109,19 @@ func (r *FakeAMQPReceiver) IssueCredit(credit uint32) error {
 	return nil
 }
 
-func (r *FakeAMQPReceiver) Credits() uint32 {
-	r.CreditsCalled++
+func (r *FakeAMQPReceiver) DrainCredit(ctx context.Context) error {
+	r.DrainCalled++
 
-	if r.CreditsImpl != nil {
-		return r.CreditsImpl()
+	if r.DrainCreditImpl != nil {
+		return r.DrainCreditImpl(ctx)
 	}
 
-	return r.RequestedCredits
-}
-
-func (r *FakeAMQPReceiver) Prefetched() *amqp.Message {
-	r.PrefetchedCalled++
-
-	if len(r.PrefetchedResults) == 0 {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 		return nil
 	}
-
-	res := r.PrefetchedResults[0]
-	r.PrefetchedResults = r.PrefetchedResults[1:]
-
-	return res
 }
 
 // Receive returns the next result from ReceiveResults or, if the ReceiveResults
@@ -138,39 +129,34 @@ func (r *FakeAMQPReceiver) Prefetched() *amqp.Message {
 func (r *FakeAMQPReceiver) Receive(ctx context.Context) (*amqp.Message, error) {
 	r.ReceiveCalled++
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-		if r.ReceiveFn != nil {
-			return r.ReceiveFn(ctx)
-		}
-
-		if len(r.ReceiveResults) == 0 {
-			<-ctx.Done()
-			return nil, ctx.Err()
-		}
-
-		res := r.ReceiveResults[0]
-		r.ReceiveResults = r.ReceiveResults[1:]
-
-		return res.M, res.E
+	if r.ReceiveFn != nil {
+		return r.ReceiveFn(ctx)
 	}
+
+	if len(r.ReceiveResults) == 0 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	res := r.ReceiveResults[0]
+	r.ReceiveResults = r.ReceiveResults[1:]
+
+	return res.M, res.E
 }
 
-func (r *FakeAMQPReceiver) ReleaseMessage(ctx context.Context, msg *amqp.Message) error {
-	r.ReleaseMessageCalled++
+// Prefetched will return the next reuslt from PrefetchedResults or, if the PrefetchedResults
+// is empty will return nil, nil.
+func (r *FakeAMQPReceiver) Prefetched(ctx context.Context) (*amqp.Message, error) {
+	r.PrefetchedCalled++
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		if r.ReleaseMessageFn != nil {
-			return r.ReleaseMessageFn(ctx, msg)
-		}
-
-		return nil
+	if len(r.PrefetchResults) == 0 {
+		return nil, nil
 	}
+
+	res := r.PrefetchResults[0]
+	r.ReceiveResults = r.PrefetchResults[1:]
+
+	return res.M, res.E
 }
 
 func (r *FakeAMQPReceiver) Close(ctx context.Context) error {
@@ -230,8 +216,8 @@ func (s *FakeAMQPSender) Close(ctx context.Context) error {
 	return nil
 }
 
-func (s *FakeAMQPSession) NewReceiver(ctx context.Context, source string, opts *amqp.ReceiverOptions) (AMQPReceiverCloser, error) {
-	return s.NewReceiverFn(ctx, source, opts)
+func (s *FakeAMQPSession) NewReceiver(opts ...amqp.LinkOption) (AMQPReceiverCloser, error) {
+	return s.NewReceiverFn(opts...)
 }
 
 func (s *FakeAMQPSession) Close(ctx context.Context) error {

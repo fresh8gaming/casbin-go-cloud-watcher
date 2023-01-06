@@ -92,7 +92,8 @@ please file an issue.
 ## Documentation
 
  * [Godoc API reference](http://godoc.org/github.com/rabbitmq/amqp091-go)
- * [RabbitMQ tutorials in Go](https://github.com/rabbitmq/rabbitmq-tutorials/tree/master/go)
+ * [RabbitMQ tutorials in Go](https://github.com/rabbitmq/rabbitmq-tutorials/tree/master/go) currently use a different client.
+    They will be switched to use this client eventually
 
 ## Contributing
 

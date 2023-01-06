@@ -4,38 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
-	"time"
 
 	"github.com/Azure/go-amqp/internal/bitmap"
-	"github.com/Azure/go-amqp/internal/debug"
 	"github.com/Azure/go-amqp/internal/encoding"
 	"github.com/Azure/go-amqp/internal/frames"
 )
-
-// Default session options
-const (
-	defaultWindow = 5000
-)
-
-// SessionOptions contains the optional settings for configuring an AMQP session.
-type SessionOptions struct {
-	// IncomingWindow sets the maximum number of unacknowledged
-	// transfer frames the server can send.
-	IncomingWindow uint32
-
-	// OutgoingWindow sets the maximum number of unacknowledged
-	// transfer frames the client can send.
-	OutgoingWindow uint32
-
-	// MaxLinks sets the maximum number of links (Senders/Receivers)
-	// allowed on the session.
-	//
-	// Minimum: 1.
-	// Default: 4294967295.
-	MaxLinks uint32
-}
 
 // Session is an AMQP session.
 //
@@ -43,7 +17,7 @@ type SessionOptions struct {
 type Session struct {
 	channel       uint16                       // session's local channel
 	remoteChannel uint16                       // session's remote channel, owned by conn.mux
-	conn          *Conn                        // underlying conn
+	conn          *conn                        // underlying conn
 	rx            chan frames.Frame            // frames destined for this session are sent on this chan by conn.mux
 	tx            chan frames.FrameBody        // non-transfer frames to be sent; session must track disposition
 	txTransfer    chan *frames.PerformTransfer // transfer frames to be sent; session must track disposition
@@ -51,16 +25,12 @@ type Session struct {
 	// flow control
 	incomingWindow uint32
 	outgoingWindow uint32
-	needFlowCount  uint32
 
-	handleMax uint32
+	handleMax        uint32
+	allocateHandle   chan *link // link handles are allocated by sending a link on this channel, nil is sent on link.rx once allocated
+	deallocateHandle chan *link // link handles are deallocated by sending a link on this channel
 
 	nextDeliveryID uint32 // atomically accessed sequence for deliveryIDs
-
-	// link management
-	linksMu    sync.RWMutex      // used to synchronize link handle allocation
-	linksByKey map[linkKey]*link // mapping of name+role link
-	handles    *bitmap.Bitmap    // allocated handles
 
 	// used for gracefully closing link
 	close     chan struct{}
@@ -69,98 +39,21 @@ type Session struct {
 	err       error
 }
 
-func newSession(c *Conn, channel uint16, opts *SessionOptions) *Session {
-	s := &Session{
-		conn:           c,
-		channel:        channel,
-		rx:             make(chan frames.Frame),
-		tx:             make(chan frames.FrameBody),
-		txTransfer:     make(chan *frames.PerformTransfer),
-		incomingWindow: defaultWindow,
-		outgoingWindow: defaultWindow,
-		handleMax:      math.MaxUint32,
-		linksMu:        sync.RWMutex{},
-		linksByKey:     make(map[linkKey]*link),
-		close:          make(chan struct{}),
-		done:           make(chan struct{}),
+func newSession(c *conn, channel uint16) *Session {
+	return &Session{
+		conn:             c,
+		channel:          channel,
+		rx:               make(chan frames.Frame),
+		tx:               make(chan frames.FrameBody),
+		txTransfer:       make(chan *frames.PerformTransfer),
+		incomingWindow:   DefaultWindow,
+		outgoingWindow:   DefaultWindow,
+		handleMax:        DefaultMaxLinks - 1,
+		allocateHandle:   make(chan *link),
+		deallocateHandle: make(chan *link),
+		close:            make(chan struct{}),
+		done:             make(chan struct{}),
 	}
-
-	if opts != nil {
-		if opts.IncomingWindow != 0 {
-			s.incomingWindow = opts.IncomingWindow
-		}
-		if opts.MaxLinks != 0 {
-			// MaxLinks is the number of total links.
-			// handleMax is the max handle ID which starts
-			// at zero.  so we decrement by one
-			s.handleMax = opts.MaxLinks - 1
-		}
-		if opts.OutgoingWindow != 0 {
-			s.outgoingWindow = opts.OutgoingWindow
-		}
-	}
-	// create handle map after options have been applied
-	s.handles = bitmap.New(s.handleMax)
-	return s
-}
-
-func (s *Session) begin(ctx context.Context) error {
-	// send Begin to server
-	begin := &frames.PerformBegin{
-		NextOutgoingID: 0,
-		IncomingWindow: s.incomingWindow,
-		OutgoingWindow: s.outgoingWindow,
-		HandleMax:      s.handleMax,
-	}
-	debug.Log(1, "TX (NewSession): %s", begin)
-
-	_ = s.txFrame(begin, nil)
-
-	// wait for response
-	var fr frames.Frame
-	select {
-	case <-ctx.Done():
-		// begin was written to the network.  assume it was
-		// received and that the ctx was too short to wait for
-		// the ack.
-		go func() {
-			_ = s.txFrame(&frames.PerformEnd{}, nil)
-			select {
-			case <-s.conn.done:
-				// conn has terminated, no need to delete the session
-			case <-time.After(5 * time.Second):
-				// don't delete the session in this case. this is to avoid recylcing
-				// a channel number for a session that might not have terminated
-				debug.Log(3, "session.begin clean-up timed out waiting for PerformEnd ack")
-			case <-s.rx:
-				// received ack that session was closed, safe to delete session
-				s.conn.deleteSession(s)
-			}
-		}()
-		return ctx.Err()
-	case <-s.conn.done:
-		return s.conn.err()
-	case fr = <-s.rx:
-		// received ack that session was created
-	}
-	debug.Log(1, "RX (NewSession): %s", fr.Body)
-
-	begin, ok := fr.Body.(*frames.PerformBegin)
-	if !ok {
-		// this codepath is hard to hit (impossible?).  if the response isn't a PerformBegin and we've not
-		// yet seen the remote channel number, the default clause in conn.mux will protect us from that.
-		// if we have seen the remote channel number then it's likely the session.mux for that channel will
-		// either swallow the frame or blow up in some other way, both causing this call to hang.
-		// deallocate session on error.  we can't call
-		// s.Close() as the session mux hasn't started yet.
-		s.conn.deleteSession(s)
-		return fmt.Errorf("unexpected begin response: %+v", fr.Body)
-	}
-
-	// start Session multiplexor
-	go s.mux(begin)
-
-	return nil
 }
 
 // Close gracefully closes the session.
@@ -174,9 +67,7 @@ func (s *Session) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	var sessionErr *SessionError
-	if errors.As(s.err, &sessionErr) && sessionErr.RemoteErr == nil && sessionErr.inner == nil {
-		// an empty SessionError means the session was closed by the caller
+	if s.err == ErrSessionClosed {
 		return nil
 	}
 	return s.err
@@ -185,8 +76,8 @@ func (s *Session) Close(ctx context.Context) error {
 // txFrame sends a frame to the connWriter.
 // it returns an error if the connection has been closed.
 func (s *Session) txFrame(p frames.FrameBody, done chan encoding.DeliveryState) error {
-	return s.conn.sendFrame(frames.Frame{
-		Type:    frames.TypeAMQP,
+	return s.conn.SendFrame(frames.Frame{
+		Type:    frameTypeAMQP,
 		Channel: s.channel,
 		Body:    p,
 		Done:    done,
@@ -194,15 +85,19 @@ func (s *Session) txFrame(p frames.FrameBody, done chan encoding.DeliveryState) 
 }
 
 // NewReceiver opens a new receiver link on the session.
-// opts: pass nil to accept the default values.
-func (s *Session) NewReceiver(ctx context.Context, source string, opts *ReceiverOptions) (*Receiver, error) {
-	r, err := newReceiver(source, s, opts)
+func (s *Session) NewReceiver(opts ...LinkOption) (*Receiver, error) {
+	r := &Receiver{
+		batching:    DefaultLinkBatching,
+		batchMaxAge: DefaultLinkBatchMaxAge,
+		maxCredit:   DefaultLinkCredit,
+	}
+
+	l, err := attachLink(s, r, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err = r.attach(ctx); err != nil {
-		return nil, err
-	}
+
+	r.link = l
 
 	// batching is just extra overhead when maxCredits == 1
 	if r.maxCredit == 1 {
@@ -220,39 +115,38 @@ func (s *Session) NewReceiver(ctx context.Context, source string, opts *Receiver
 }
 
 // NewSender opens a new sender link on the session.
-// opts: pass nil to accept the default values.
-func (s *Session) NewSender(ctx context.Context, target string, opts *SenderOptions) (*Sender, error) {
-	l, err := newSender(target, s, opts)
+func (s *Session) NewSender(opts ...LinkOption) (*Sender, error) {
+	l, err := attachLink(s, nil, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err = l.attach(ctx); err != nil {
-		return nil, err
-	}
 
-	return l, nil
+	return &Sender{link: l}, nil
 }
 
 func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 	defer func() {
-		s.conn.deleteSession(s)
+		// clean up session record in conn.mux()
+		select {
+		case <-s.rx:
+			// discard any incoming frames to keep conn mux unblocked
+		case s.conn.DelSession <- s:
+			// successfully deleted session
+		case <-s.conn.Done:
+			s.err = s.conn.Err()
+		}
 		if s.err == nil {
-			s.err = &SessionError{}
-		} else if connErr := (&ConnError{}); !errors.As(s.err, &connErr) {
-			// only wrap non-ConnectionError error types
-			var amqpErr *Error
-			if errors.As(s.err, &amqpErr) {
-				s.err = &SessionError{RemoteErr: amqpErr}
-			} else {
-				s.err = &SessionError{inner: s.err}
-			}
+			s.err = ErrSessionClosed
 		}
 		// Signal goroutines waiting on the session.
 		close(s.done)
 	}()
 
 	var (
-		links                     = make(map[uint32]*link)  // mapping of remote handles to links
+		links      = make(map[uint32]*link)  // mapping of remote handles to links
+		linksByKey = make(map[linkKey]*link) // mapping of name+role link
+		handles    = bitmap.New(s.handleMax) // allocated handles
+
 		handlesByDeliveryID       = make(map[uint32]uint32) // mapping of deliveryIDs to handles
 		deliveryIDByHandle        = make(map[uint32]uint32) // mapping of handles to latest deliveryID
 		handlesByRemoteDeliveryID = make(map[uint32]uint32) // mapping of remote deliveryID to handles
@@ -270,7 +164,7 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 		txTransfer := s.txTransfer
 		// disable txTransfer if flow control windows have been exceeded
 		if remoteIncomingWindow == 0 || s.outgoingWindow == 0 {
-			debug.Log(1, "TX(Session): Disabling txTransfer - window exceeded. remoteIncomingWindow: %d outgoingWindow:%d",
+			debug(1, "TX(Session): Disabling txTransfer - window exceeded. remoteIncomingWindow: %d outgoingWindow:%d",
 				remoteIncomingWindow,
 				s.outgoingWindow)
 			txTransfer = nil
@@ -278,8 +172,8 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 
 		select {
 		// conn has completed, exit
-		case <-s.conn.done:
-			s.err = s.conn.err()
+		case <-s.conn.Done:
+			s.err = s.conn.Err()
 			return
 
 		// session is being closed by user
@@ -297,16 +191,45 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 					if ok {
 						break EndLoop
 					}
-				case <-s.conn.done:
-					s.err = s.conn.err()
+				case <-s.conn.Done:
+					s.err = s.conn.Err()
 					return
 				}
 			}
 			return
 
+		// handle allocation request
+		case l := <-s.allocateHandle:
+			// Check if link name already exists, if so then an error should be returned
+			if linksByKey[l.Key] != nil {
+				l.err = fmt.Errorf("link with name '%v' already exists", l.Key.name)
+				l.RX <- nil
+				continue
+			}
+
+			next, ok := handles.Next()
+			if !ok {
+				// handle numbers are zero-based, report the actual count
+				l.err = fmt.Errorf("reached session handle max (%d)", s.handleMax+1)
+				l.RX <- nil
+				continue
+			}
+
+			l.Handle = next       // allocate handle to the link
+			linksByKey[l.Key] = l // add to mapping
+			l.RX <- nil           // send nil on channel to indicate allocation complete
+
+		// handle deallocation request
+		case l := <-s.deallocateHandle:
+			delete(links, l.RemoteHandle)
+			delete(deliveryIDByHandle, l.Handle)
+			delete(linksByKey, l.Key)
+			handles.Remove(l.Handle)
+			close(l.RX) // close channel to indicate deallocation
+
 		// incoming frame for link
 		case fr := <-s.rx:
-			debug.Log(1, "RX(Session): %s", fr.Body)
+			debug(1, "RX(Session): %s", fr.Body)
 
 			switch body := fr.Body.(type) {
 			// Disposition frames can reference transfers from more than one
@@ -325,7 +248,7 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 
 					handle, ok := handles[deliveryID]
 					if !ok {
-						debug.Log(2, "role %s: didn't find deliveryID %d in handles map", body.Role, deliveryID)
+						debug(2, "role %s: didn't find deliveryID %d in handles map", body.Role, deliveryID)
 						continue
 					}
 					delete(handles, deliveryID)
@@ -358,7 +281,7 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 					//        the begin frame for the session"
 					_ = s.txFrame(&frames.PerformEnd{
 						Error: &Error{
-							Condition:   ErrCondNotAllowed,
+							Condition:   ErrorNotAllowed,
 							Description: "next-incoming-id not set after session established",
 						},
 					}, nil)
@@ -383,7 +306,7 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				// initial-outgoing-id(endpoint) + incoming-window(flow) - next-outgoing-id(endpoint)"
 				remoteIncomingWindow = body.IncomingWindow - nextOutgoingID
 				remoteIncomingWindow += *body.NextIncomingID
-				debug.Log(3, "RX(Session) Flow - remoteOutgoingWindow: %d remoteIncomingWindow: %d nextOutgoingID: %d", remoteOutgoingWindow, remoteIncomingWindow, nextOutgoingID)
+				debug(3, "RX(Session) Flow - remoteOutgoingWindow: %d remoteIncomingWindow: %d nextOutgoingID: %d", remoteOutgoingWindow, remoteIncomingWindow, nextOutgoingID)
 
 				// Send to link if handle is set
 				if body.Handle != nil {
@@ -404,7 +327,7 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 						NextOutgoingID: nextOutgoingID,
 						OutgoingWindow: s.outgoingWindow,
 					}
-					debug.Log(1, "TX (session.mux): %s", resp)
+					debug(1, "TX (session.mux): %s", resp)
 					_ = s.txFrame(resp, nil)
 				}
 
@@ -414,21 +337,18 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				// attach frame.
 				//
 				// Note body.Role is the remote peer's role, we reverse for the local key.
-				s.linksMu.RLock()
-				link, linkOk := s.linksByKey[linkKey{name: body.Name, role: !body.Role}]
-				s.linksMu.RUnlock()
+				link, linkOk := linksByKey[linkKey{name: body.Name, role: !body.Role}]
 				if !linkOk {
 					s.err = fmt.Errorf("protocol error: received mismatched attach frame %+v", body)
 					return
 				}
 
-				link.remoteHandle = body.Handle
-				links[link.remoteHandle] = link
+				link.RemoteHandle = body.Handle
+				links[link.RemoteHandle] = link
 
 				s.muxFrameToLink(link, fr.Body)
 
 			case *frames.PerformTransfer:
-				s.needFlowCount++
 				// "Upon receiving a transfer, the receiving endpoint will
 				// increment the next-incoming-id to match the implicit
 				// transfer-id of the incoming transfer plus one, as well
@@ -441,25 +361,23 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				}
 				link, ok := links[body.Handle]
 				if !ok {
-					// TODO: per section 2.8.17 I think this should return an error
 					continue
 				}
 
 				select {
-				case <-s.conn.done:
-				case link.rx <- fr.Body:
+				case <-s.conn.Done:
+				case link.RX <- fr.Body:
 				}
 
 				// if this message is received unsettled and link rcv-settle-mode == second, add to handlesByRemoteDeliveryID
-				if !body.Settled && body.DeliveryID != nil && link.receiverSettleMode != nil && *link.receiverSettleMode == ReceiverSettleModeSecond {
-					debug.Log(1, "TX(Session): adding handle to handlesByRemoteDeliveryID. delivery ID: %d", *body.DeliveryID)
+				if !body.Settled && body.DeliveryID != nil && link.ReceiverSettleMode != nil && *link.ReceiverSettleMode == ModeSecond {
+					debug(1, "TX(Session): adding handle to handlesByRemoteDeliveryID. delivery ID: %d", *body.DeliveryID)
 					handlesByRemoteDeliveryID[*body.DeliveryID] = body.Handle
 				}
 
+				debug(3, "TX(Session) Flow? remoteOutgoingWindow(%d) < s.incomingWindow(%d)/2\n", remoteOutgoingWindow, s.incomingWindow)
 				// Update peer's outgoing window if half has been consumed.
-				if s.needFlowCount >= s.incomingWindow/2 {
-					debug.Log(3, "TX(Session %d) Flow s.needFlowCount(%d) >= s.incomingWindow(%d)/2\n", s.channel, s.needFlowCount, s.incomingWindow)
-					s.needFlowCount = 0
+				if remoteOutgoingWindow < s.incomingWindow/2 {
 					nID := nextIncomingID
 					flow := &frames.PerformFlow{
 						NextIncomingID: &nID,
@@ -467,36 +385,25 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 						NextOutgoingID: nextOutgoingID,
 						OutgoingWindow: s.outgoingWindow,
 					}
-					debug.Log(1, "TX(Session): %s", flow)
+					debug(1, "TX(Session): %s", flow)
 					_ = s.txFrame(flow, nil)
 				}
 
 			case *frames.PerformDetach:
 				link, ok := links[body.Handle]
 				if !ok {
-					// TODO: per section 2.8.17 I think this should return an error
 					continue
 				}
 				s.muxFrameToLink(link, fr.Body)
 
-				// we received a detach frame and sent it to the link.
-				// this was either the response to a client-side initiated
-				// detach or our peer detached us. either way, now that
-				// the link has processed the frame it's detached so we
-				// are safe to clean up its state.
-				delete(links, link.remoteHandle)
-				delete(deliveryIDByHandle, link.handle)
-
 			case *frames.PerformEnd:
 				_ = s.txFrame(&frames.PerformEnd{}, nil)
-				if body.Error != nil {
-					s.err = body.Error
-				}
+				s.err = fmt.Errorf("session ended by server: %s", body.Error)
 				return
 
 			default:
 				// TODO: evaluate
-				debug.Log(1, "session mux: unexpected frame: %s\n", body)
+				debug(1, "session mux: unexpected frame: %s\n", body)
 			}
 
 		case fr := <-txTransfer:
@@ -529,7 +436,7 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				fr.Done = nil
 			}
 
-			debug.Log(2, "TX(Session) - txtransfer: %s", fr)
+			debug(2, "TX(Session) - txtransfer: %s", fr)
 			_ = s.txFrame(fr, fr.Done)
 
 			// "Upon sending a transfer, the sending endpoint will increment
@@ -549,57 +456,26 @@ func (s *Session) mux(remoteBegin *frames.PerformBegin) {
 				fr.IncomingWindow = s.incomingWindow
 				fr.NextOutgoingID = nextOutgoingID
 				fr.OutgoingWindow = s.outgoingWindow
-				debug.Log(1, "TX(Session) - tx: %s", fr)
+				debug(1, "TX(Session) - tx: %s", fr)
 				_ = s.txFrame(fr, nil)
 			case *frames.PerformTransfer:
 				panic("transfer frames must use txTransfer")
 			default:
-				debug.Log(1, "TX(Session) - default: %s", fr)
+				debug(1, "TX(Session) - default: %s", fr)
 				_ = s.txFrame(fr, nil)
 			}
 		}
 	}
 }
 
-func (s *Session) allocateHandle(l *link) error {
-	s.linksMu.Lock()
-	defer s.linksMu.Unlock()
-
-	// Check if link name already exists, if so then an error should be returned
-	existing := s.linksByKey[l.key]
-	if existing != nil {
-		return fmt.Errorf("link with name '%v' already exists", l.key.name)
-	}
-
-	next, ok := s.handles.Next()
-	if !ok {
-		// handle numbers are zero-based, report the actual count
-		return fmt.Errorf("reached session handle max (%d)", s.handleMax+1)
-	}
-
-	l.handle = next         // allocate handle to the link
-	s.linksByKey[l.key] = l // add to mapping
-
-	return nil
-}
-
-func (s *Session) deallocateHandle(l *link) {
-	s.linksMu.Lock()
-	defer s.linksMu.Unlock()
-
-	delete(s.linksByKey, l.key)
-	s.handles.Remove(l.handle)
-	close(l.rx)
-}
-
 func (s *Session) muxFrameToLink(l *link, fr frames.FrameBody) {
 	select {
-	case l.rx <- fr:
+	case l.RX <- fr:
 		// frame successfully sent to link
-	case <-l.detached:
+	case <-l.Detached:
 		// link is closed
 		// this should be impossible to hit as the link has been removed from the session once Detached is closed
-	case <-s.conn.done:
+	case <-s.conn.Done:
 		// conn is closed
 	}
 }

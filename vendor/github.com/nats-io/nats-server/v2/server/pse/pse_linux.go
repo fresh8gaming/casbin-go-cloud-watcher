@@ -16,6 +16,7 @@ package pse
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -47,7 +48,7 @@ func init() {
 
 // Sampling function to keep pcpu relevant.
 func periodic() {
-	contents, err := os.ReadFile(procStatFile)
+	contents, err := ioutil.ReadFile(procStatFile)
 	if err != nil {
 		return
 	}
@@ -87,7 +88,7 @@ func periodic() {
 
 // ProcUsage returns CPU usage
 func ProcUsage(pcpu *float64, rss, vss *int64) error {
-	contents, err := os.ReadFile(procStatFile)
+	contents, err := ioutil.ReadFile(procStatFile)
 	if err != nil {
 		return err
 	}

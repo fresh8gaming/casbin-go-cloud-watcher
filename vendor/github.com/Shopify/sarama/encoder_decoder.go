@@ -57,15 +57,12 @@ type versionedDecoder interface {
 
 // decode takes bytes and a decoder and fills the fields of the decoder from the bytes,
 // interpreted using Kafka's encoding rules.
-func decode(buf []byte, in decoder, metricRegistry metrics.Registry) error {
+func decode(buf []byte, in decoder) error {
 	if buf == nil {
 		return nil
 	}
 
-	helper := realDecoder{
-		raw:      buf,
-		registry: metricRegistry,
-	}
+	helper := realDecoder{raw: buf}
 	err := in.decode(&helper)
 	if err != nil {
 		return err
@@ -78,15 +75,12 @@ func decode(buf []byte, in decoder, metricRegistry metrics.Registry) error {
 	return nil
 }
 
-func versionedDecode(buf []byte, in versionedDecoder, version int16, metricRegistry metrics.Registry) error {
+func versionedDecode(buf []byte, in versionedDecoder, version int16) error {
 	if buf == nil {
 		return nil
 	}
 
-	helper := realDecoder{
-		raw:      buf,
-		registry: metricRegistry,
-	}
+	helper := realDecoder{raw: buf}
 	err := in.decode(&helper, version)
 	if err != nil {
 		return err

@@ -32,7 +32,7 @@ type sendq struct {
 }
 
 func (s *Server) newSendQ() *sendq {
-	sq := &sendq{s: s, q: s.newIPQueue("SendQ")}
+	sq := &sendq{s: s, q: newIPQueue(ipQueue_Logger("Send", s.ipqLog))}
 	s.startGoRoutine(sq.internalLoop)
 	return sq
 }

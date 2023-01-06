@@ -56,8 +56,7 @@ type AMQPLinks interface {
 }
 
 // AMQPLinksImpl manages the set of AMQP links (and detritus) typically needed to work
-// within Service Bus:
-//
+//  within Service Bus:
 // - An *goamqp.Sender or *goamqp.Receiver AMQP link (could also be 'both' if needed)
 // - A `$management` link
 // - an *goamqp.Session
@@ -375,25 +374,19 @@ func (l *AMQPLinksImpl) CloseIfNeeded(ctx context.Context, err error) RecoveryKi
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if IsCancelError(err) {
-		log.Writef(exported.EventConn, "No close needed for cancellation")
-		return RecoveryKindNone
-	}
-
 	rk := l.getRecoveryKindFunc(err)
 
 	switch rk {
 	case RecoveryKindLink:
-		log.Writef(exported.EventConn, "Closing links for error %s", err.Error())
+		_ = l.closeWithoutLocking(ctx, false)
+		return rk
+	case RecoveryKindConn:
+		_ = l.ns.Close(ctx, false)
 		_ = l.closeWithoutLocking(ctx, false)
 		return rk
 	case RecoveryKindFatal:
-		log.Writef(exported.EventConn, "Fatal error cleanup")
-		fallthrough
-	case RecoveryKindConn:
-		log.Writef(exported.EventConn, "Closing connection AND links for error %s", err.Error())
-		_ = l.ns.Close(ctx, false)
-		_ = l.closeWithoutLocking(ctx, false)
+		// it's not entirely clear what the right cleanup would be here, so we leave that up to the
+		// calling application.
 		return rk
 	case RecoveryKindNone:
 		return rk
