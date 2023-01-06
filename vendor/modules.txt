@@ -328,11 +328,11 @@ github.com/klauspost/compress/zstd/internal/xxhash
 # github.com/minio/highwayhash v1.0.2
 ## explicit; go 1.15
 github.com/minio/highwayhash
-# github.com/nats-io/jwt/v2 v2.2.1-0.20220113022732-58e87895b296
+# github.com/nats-io/jwt/v2 v2.3.0
 ## explicit; go 1.16
 github.com/nats-io/jwt/v2
-# github.com/nats-io/nats-server/v2 v2.7.4
-## explicit; go 1.17
+# github.com/nats-io/nats-server/v2 v2.9.10
+## explicit; go 1.19
 github.com/nats-io/nats-server/v2/conf
 github.com/nats-io/nats-server/v2/internal/ldap
 github.com/nats-io/nats-server/v2/logger
@@ -385,6 +385,8 @@ go.opencensus.io/trace
 go.opencensus.io/trace/internal
 go.opencensus.io/trace/propagation
 go.opencensus.io/trace/tracestate
+# go.uber.org/automaxprocs v1.5.1
+## explicit; go 1.18
 # gocloud.dev v0.27.0
 ## explicit; go 1.12
 gocloud.dev/aws
