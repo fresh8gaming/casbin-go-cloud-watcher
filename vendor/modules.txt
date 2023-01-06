@@ -331,7 +331,7 @@ github.com/minio/highwayhash
 # github.com/nats-io/jwt/v2 v2.2.1-0.20220113022732-58e87895b296
 ## explicit; go 1.16
 github.com/nats-io/jwt/v2
-# github.com/nats-io/nats-server/v2 v2.7.2
+# github.com/nats-io/nats-server/v2 v2.7.4
 ## explicit; go 1.17
 github.com/nats-io/nats-server/v2/conf
 github.com/nats-io/nats-server/v2/internal/ldap

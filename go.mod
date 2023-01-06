@@ -4,7 +4,7 @@ go 1.18
 
 require (
 	github.com/casbin/casbin v1.9.1
-	github.com/nats-io/nats-server/v2 v2.7.2
+	github.com/nats-io/nats-server/v2 v2.7.4
 	github.com/nats-io/nats.go v1.22.1
 	github.com/rusenask/casbin-go-cloud-watcher v0.0.0-20210430125010-5fcd1ac6993d
 	gocloud.dev v0.27.0
