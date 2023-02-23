@@ -25,10 +25,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nuid"
 	"golang.org/x/time/rate"
+)
+
+// Headers sent with Request Timeout
+const (
+	JSPullRequestPendingMsgs  = "Nats-Pending-Messages"
+	JSPullRequestPendingBytes = "Nats-Pending-Bytes"
 )
 
 type ConsumerInfo struct {
@@ -47,7 +54,9 @@ type ConsumerInfo struct {
 }
 
 type ConsumerConfig struct {
+	// Durable is deprecated. All consumers will have names. picked by clients.
 	Durable         string          `json:"durable_name,omitempty"`
+	Name            string          `json:"name,omitempty"`
 	Description     string          `json:"description,omitempty"`
 	DeliverPolicy   DeliverPolicy   `json:"deliver_policy"`
 	OptStartSeq     uint64          `json:"opt_start_seq,omitempty"`
@@ -67,8 +76,9 @@ type ConsumerConfig struct {
 	HeadersOnly     bool            `json:"headers_only,omitempty"`
 
 	// Pull based options.
-	MaxRequestBatch   int           `json:"max_batch,omitempty"`
-	MaxRequestExpires time.Duration `json:"max_expires,omitempty"`
+	MaxRequestBatch    int           `json:"max_batch,omitempty"`
+	MaxRequestExpires  time.Duration `json:"max_expires,omitempty"`
+	MaxRequestMaxBytes int           `json:"max_bytes,omitempty"`
 
 	// Push based consumers.
 	DeliverSubject string `json:"deliver_subject,omitempty"`
@@ -76,6 +86,11 @@ type ConsumerConfig struct {
 
 	// Ephemeral inactivity threshold.
 	InactiveThreshold time.Duration `json:"inactive_threshold,omitempty"`
+
+	// Generally inherited by parent stream and other markers, now can be configured directly.
+	Replicas int `json:"num_replicas"`
+	// Force memory storage.
+	MemoryStorage bool `json:"mem_storage,omitempty"`
 
 	// Don't add to general clients.
 	Direct bool `json:"direct,omitempty"`
@@ -196,8 +211,23 @@ var (
 	AckTerm = []byte("+TERM")
 )
 
+func (consCfg ConsumerConfig) replicas(strCfg *StreamConfig) int {
+	if consCfg.Replicas == 0 {
+		if !isDurableConsumer(&consCfg) && strCfg.Retention == LimitsPolicy {
+			return 1
+		}
+		return strCfg.Replicas
+	} else {
+		return consCfg.Replicas
+	}
+}
+
 // Consumer is a jetstream consumer.
 type consumer struct {
+	// Atomic used to notify that we want to process an ack.
+	// This will be checked in checkPending to abort processing
+	// and let ack be processed in priority.
+	awl               int64
 	mu                sync.RWMutex
 	js                *jetStream
 	mset              *stream
@@ -212,8 +242,8 @@ type consumer struct {
 	dseq              uint64
 	adflr             uint64
 	asflr             uint64
-	sgap              uint64
-	lsgap             uint64
+	npc               uint64
+	npcm              uint64
 	dsubj             string
 	qgroup            string
 	lss               *lastSeqSkipList
@@ -239,6 +269,7 @@ type consumer struct {
 	maxdc             uint64
 	waiting           *waitQueue
 	cfg               ConsumerConfig
+	ici               *ConsumerInfo
 	store             ConsumerStore
 	active            bool
 	replay            bool
@@ -251,6 +282,7 @@ type consumer struct {
 	inch              chan bool
 	sfreq             int32
 	ackEventT         string
+	nakEventT         string
 	deliveryExcEventT string
 	created           time.Time
 	ldt               time.Time
@@ -258,17 +290,25 @@ type consumer struct {
 	closed            bool
 
 	// Clustered.
-	ca      *consumerAssignment
-	node    RaftNode
-	infoSub *subscription
-	lqsent  time.Time
-	prm     map[string]struct{}
-	prOk    bool
+	ca        *consumerAssignment
+	node      RaftNode
+	infoSub   *subscription
+	lqsent    time.Time
+	prm       map[string]struct{}
+	prOk      bool
+	uch       chan struct{}
+	retention RetentionPolicy
 
 	// R>1 proposals
 	pch   chan struct{}
 	phead *proposal
 	ptail *proposal
+
+	// Ack queue
+	ackMsgs *ipQueue
+
+	// For stream signaling.
+	sigSub *subscription
 }
 
 type proposal struct {
@@ -284,13 +324,13 @@ const (
 	JsDeleteWaitTimeDefault = 5 * time.Second
 	// JsFlowControlMaxPending specifies default pending bytes during flow control that can be
 	// outstanding.
-	JsFlowControlMaxPending = 1 * 1024 * 1024
+	JsFlowControlMaxPending = 32 * 1024 * 1024
 	// JsDefaultMaxAckPending is set for consumers with explicit ack that do not set the max ack pending.
-	JsDefaultMaxAckPending = 20_000
+	JsDefaultMaxAckPending = 1000
 )
 
 // Helper function to set consumer config defaults from above.
-func setConsumerConfigDefaults(config *ConsumerConfig) {
+func setConsumerConfigDefaults(config *ConsumerConfig, lim *JSLimitOpts, accLim *JetStreamAccountLimits) {
 	// Set to default if not specified.
 	if config.DeliverSubject == _EMPTY_ && config.MaxWaiting == 0 {
 		config.MaxWaiting = JSWaitQueueDefaultMax
@@ -309,106 +349,123 @@ func setConsumerConfigDefaults(config *ConsumerConfig) {
 	}
 	// Set proper default for max ack pending if we are ack explicit and none has been set.
 	if (config.AckPolicy == AckExplicit || config.AckPolicy == AckAll) && config.MaxAckPending == 0 {
-		config.MaxAckPending = JsDefaultMaxAckPending
+		accPending := JsDefaultMaxAckPending
+		if lim.MaxAckPending > 0 && lim.MaxAckPending < accPending {
+			accPending = lim.MaxAckPending
+		}
+		if accLim.MaxAckPending > 0 && accLim.MaxAckPending < accPending {
+			accPending = accLim.MaxAckPending
+		}
+		config.MaxAckPending = accPending
+	}
+	// if applicable set max request batch size
+	if config.DeliverSubject == _EMPTY_ && config.MaxRequestBatch == 0 && lim.MaxRequestBatch > 0 {
+		config.MaxRequestBatch = lim.MaxRequestBatch
 	}
 }
 
-func (mset *stream) addConsumer(config *ConsumerConfig) (*consumer, error) {
-	return mset.addConsumerWithAssignment(config, _EMPTY_, nil)
-}
+// Check the consumer config. If we are recovering don't check filter subjects.
+func checkConsumerCfg(
+	config *ConsumerConfig,
+	srvLim *JSLimitOpts,
+	cfg *StreamConfig,
+	acc *Account,
+	accLim *JetStreamAccountLimits,
+	isRecovering bool,
+) *ApiError {
 
-func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname string, ca *consumerAssignment) (*consumer, error) {
-	mset.mu.RLock()
-	s, jsa := mset.srv, mset.jsa
-	mset.mu.RUnlock()
-
-	// If we do not have the consumer currently assigned to us in cluster mode we will proceed but warn.
-	// This can happen on startup with restored state where on meta replay we still do not have
-	// the assignment. Running in single server mode this always returns true.
-	if oname != _EMPTY_ && !jsa.consumerAssigned(mset.name(), oname) {
-		s.Debugf("Consumer %q > %q does not seem to be assigned to this server", mset.name(), oname)
+	// Check if replicas is defined but exceeds parent stream.
+	if config.Replicas > 0 && config.Replicas > cfg.Replicas {
+		return NewJSConsumerReplicasExceedsStreamError()
 	}
-
-	if config == nil {
-		return nil, NewJSConsumerConfigRequiredError()
+	// Check that it is not negative
+	if config.Replicas < 0 {
+		return NewJSReplicasCountCannotBeNegativeError()
 	}
-
-	// Make sure we have sane defaults.
-	setConsumerConfigDefaults(config)
 
 	// Check if we have a BackOff defined that MaxDeliver is within range etc.
 	if lbo := len(config.BackOff); lbo > 0 && config.MaxDeliver <= lbo {
-		return nil, NewJSConsumerMaxDeliverBackoffError()
+		return NewJSConsumerMaxDeliverBackoffError()
 	}
 
 	if len(config.Description) > JSMaxDescriptionLen {
-		return nil, NewJSConsumerDescriptionTooLongError(JSMaxDescriptionLen)
+		return NewJSConsumerDescriptionTooLongError(JSMaxDescriptionLen)
 	}
 
-	var err error
 	// For now expect a literal subject if its not empty. Empty means work queue mode (pull mode).
 	if config.DeliverSubject != _EMPTY_ {
 		if !subjectIsLiteral(config.DeliverSubject) {
-			return nil, NewJSConsumerDeliverToWildcardsError()
+			return NewJSConsumerDeliverToWildcardsError()
 		}
 		if !IsValidSubject(config.DeliverSubject) {
-			return nil, NewJSConsumerInvalidDeliverSubjectError()
+			return NewJSConsumerInvalidDeliverSubjectError()
 		}
-		if mset.deliveryFormsCycle(config.DeliverSubject) {
-			return nil, NewJSConsumerDeliverCycleError()
+		if deliveryFormsCycle(cfg, config.DeliverSubject) {
+			return NewJSConsumerDeliverCycleError()
 		}
 		if config.MaxWaiting != 0 {
-			return nil, NewJSConsumerPushMaxWaitingError()
+			return NewJSConsumerPushMaxWaitingError()
 		}
 		if config.MaxAckPending > 0 && config.AckPolicy == AckNone {
-			return nil, NewJSConsumerMaxPendingAckPolicyRequiredError()
+			return NewJSConsumerMaxPendingAckPolicyRequiredError()
 		}
 		if config.Heartbeat > 0 && config.Heartbeat < 100*time.Millisecond {
-			return nil, NewJSConsumerSmallHeartbeatError()
+			return NewJSConsumerSmallHeartbeatError()
 		}
 	} else {
-		// Pull mode / work queue mode require explicit ack.
-		if config.AckPolicy == AckNone {
-			return nil, NewJSConsumerPullRequiresAckError()
+		// Pull mode with work queue retention from the stream requires an explicit ack.
+		if config.AckPolicy == AckNone && cfg.Retention == WorkQueuePolicy {
+			return NewJSConsumerPullRequiresAckError()
 		}
 		if config.RateLimit > 0 {
-			return nil, NewJSConsumerPullWithRateLimitError()
+			return NewJSConsumerPullWithRateLimitError()
 		}
 		if config.MaxWaiting < 0 {
-			return nil, NewJSConsumerMaxWaitingNegativeError()
+			return NewJSConsumerMaxWaitingNegativeError()
 		}
 		if config.Heartbeat > 0 {
-			return nil, NewJSConsumerHBRequiresPushError()
+			return NewJSConsumerHBRequiresPushError()
 		}
 		if config.FlowControl {
-			return nil, NewJSConsumerFCRequiresPushError()
+			return NewJSConsumerFCRequiresPushError()
 		}
 		if config.MaxRequestBatch < 0 {
-			return nil, NewJSConsumerMaxRequestBatchNegativeError()
+			return NewJSConsumerMaxRequestBatchNegativeError()
 		}
 		if config.MaxRequestExpires != 0 && config.MaxRequestExpires < time.Millisecond {
-			return nil, NewJSConsumerMaxRequestExpiresToSmallError()
+			return NewJSConsumerMaxRequestExpiresToSmallError()
 		}
+		if srvLim.MaxRequestBatch > 0 && config.MaxRequestBatch > srvLim.MaxRequestBatch {
+			return NewJSConsumerMaxRequestBatchExceededError(srvLim.MaxRequestBatch)
+		}
+	}
+	if srvLim.MaxAckPending > 0 && config.MaxAckPending > srvLim.MaxAckPending {
+		return NewJSConsumerMaxPendingAckExcessError(srvLim.MaxAckPending)
+	}
+	if accLim.MaxAckPending > 0 && config.MaxAckPending > accLim.MaxAckPending {
+		return NewJSConsumerMaxPendingAckExcessError(accLim.MaxAckPending)
 	}
 
 	// Direct need to be non-mapped ephemerals.
 	if config.Direct {
 		if config.DeliverSubject == _EMPTY_ {
-			return nil, NewJSConsumerDirectRequiresPushError()
+			return NewJSConsumerDirectRequiresPushError()
 		}
 		if isDurableConsumer(config) {
-			return nil, NewJSConsumerDirectRequiresEphemeralError()
-		}
-		if ca != nil {
-			return nil, NewJSConsumerOnMappedError()
+			return NewJSConsumerDirectRequiresEphemeralError()
 		}
 	}
 
 	// As best we can make sure the filtered subject is valid.
 	if config.FilterSubject != _EMPTY_ {
-		subjects, hasExt := mset.allSubjects()
-		if !validFilteredSubject(config.FilterSubject, subjects) && !hasExt {
-			return nil, NewJSConsumerFilterNotSubsetError()
+		subjects := copyStrings(cfg.Subjects)
+		// explicitly skip validFilteredSubject when recovering
+		hasExt := isRecovering
+		if !isRecovering {
+			subjects, hasExt = gatherSourceMirrorSubjects(subjects, cfg, acc)
+		}
+		if !hasExt && !validFilteredSubject(config.FilterSubject, subjects) {
+			return NewJSConsumerFilterNotSubsetError()
 		}
 	}
 
@@ -424,58 +481,112 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	switch config.DeliverPolicy {
 	case DeliverAll:
 		if config.OptStartSeq > 0 {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("all", "sequence"))
+			return NewJSConsumerInvalidPolicyError(badStart("all", "sequence"))
 		}
 		if config.OptStartTime != nil {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("all", "time"))
+			return NewJSConsumerInvalidPolicyError(badStart("all", "time"))
 		}
 	case DeliverLast:
 		if config.OptStartSeq > 0 {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("last", "sequence"))
+			return NewJSConsumerInvalidPolicyError(badStart("last", "sequence"))
 		}
 		if config.OptStartTime != nil {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("last", "time"))
+			return NewJSConsumerInvalidPolicyError(badStart("last", "time"))
 		}
 	case DeliverLastPerSubject:
 		if config.OptStartSeq > 0 {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("last per subject", "sequence"))
+			return NewJSConsumerInvalidPolicyError(badStart("last per subject", "sequence"))
 		}
 		if config.OptStartTime != nil {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("last per subject", "time"))
+			return NewJSConsumerInvalidPolicyError(badStart("last per subject", "time"))
 		}
 		if config.FilterSubject == _EMPTY_ {
-			return nil, NewJSConsumerInvalidPolicyError(notSet("last per subject", "filter subject"))
+			return NewJSConsumerInvalidPolicyError(notSet("last per subject", "filter subject"))
 		}
 	case DeliverNew:
 		if config.OptStartSeq > 0 {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("new", "sequence"))
+			return NewJSConsumerInvalidPolicyError(badStart("new", "sequence"))
 		}
 		if config.OptStartTime != nil {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("new", "time"))
+			return NewJSConsumerInvalidPolicyError(badStart("new", "time"))
 		}
 	case DeliverByStartSequence:
 		if config.OptStartSeq == 0 {
-			return nil, NewJSConsumerInvalidPolicyError(notSet("by start sequence", "start sequence"))
+			return NewJSConsumerInvalidPolicyError(notSet("by start sequence", "start sequence"))
 		}
 		if config.OptStartTime != nil {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("by start sequence", "time"))
+			return NewJSConsumerInvalidPolicyError(badStart("by start sequence", "time"))
 		}
 	case DeliverByStartTime:
 		if config.OptStartTime == nil {
-			return nil, NewJSConsumerInvalidPolicyError(notSet("by start time", "start time"))
+			return NewJSConsumerInvalidPolicyError(notSet("by start time", "start time"))
 		}
 		if config.OptStartSeq != 0 {
-			return nil, NewJSConsumerInvalidPolicyError(badStart("by start time", "start sequence"))
+			return NewJSConsumerInvalidPolicyError(badStart("by start time", "start sequence"))
 		}
+	}
+
+	if config.SampleFrequency != _EMPTY_ {
+		s := strings.TrimSuffix(config.SampleFrequency, "%")
+		if sampleFreq, err := strconv.Atoi(s); err != nil || sampleFreq < 0 {
+			return NewJSConsumerInvalidSamplingError(err)
+		}
+	}
+
+	// We reject if flow control is set without heartbeats.
+	if config.FlowControl && config.Heartbeat == 0 {
+		return NewJSConsumerWithFlowControlNeedsHeartbeatsError()
+	}
+
+	if config.Durable != _EMPTY_ && config.Name != _EMPTY_ {
+		if config.Name != config.Durable {
+			return NewJSConsumerCreateDurableAndNameMismatchError()
+		}
+	}
+
+	return nil
+}
+
+func (mset *stream) addConsumer(config *ConsumerConfig) (*consumer, error) {
+	return mset.addConsumerWithAssignment(config, _EMPTY_, nil, false)
+}
+
+func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname string, ca *consumerAssignment, isRecovering bool) (*consumer, error) {
+	mset.mu.RLock()
+	s, jsa, tierName, cfg, acc := mset.srv, mset.jsa, mset.tier, mset.cfg, mset.acc
+	retention := cfg.Retention
+	mset.mu.RUnlock()
+
+	// If we do not have the consumer currently assigned to us in cluster mode we will proceed but warn.
+	// This can happen on startup with restored state where on meta replay we still do not have
+	// the assignment. Running in single server mode this always returns true.
+	if oname != _EMPTY_ && !jsa.consumerAssigned(mset.name(), oname) {
+		s.Debugf("Consumer %q > %q does not seem to be assigned to this server", mset.name(), oname)
+	}
+
+	if config == nil {
+		return nil, NewJSConsumerConfigRequiredError()
+	}
+
+	jsa.usageMu.RLock()
+	selectedLimits, limitsFound := jsa.limits[tierName]
+	jsa.usageMu.RUnlock()
+	if !limitsFound {
+		return nil, NewJSNoLimitsError()
+	}
+
+	srvLim := &s.getOpts().JetStreamLimits
+	// Make sure we have sane defaults.
+	setConsumerConfigDefaults(config, srvLim, &selectedLimits)
+
+	if err := checkConsumerCfg(config, srvLim, &cfg, acc, &selectedLimits, isRecovering); err != nil {
+		return nil, err
 	}
 
 	sampleFreq := 0
 	if config.SampleFrequency != _EMPTY_ {
-		s := strings.TrimSuffix(config.SampleFrequency, "%")
-		sampleFreq, err = strconv.Atoi(s)
-		if err != nil {
-			return nil, NewJSConsumerInvalidSamplingError(err)
-		}
+		// Can't fail as checkConsumerCfg checks correct format
+		sampleFreq, _ = strconv.Atoi(strings.TrimSuffix(config.SampleFrequency, "%"))
 	}
 
 	// Grab the client, account and server reference.
@@ -483,20 +594,30 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	if c == nil {
 		return nil, NewJSStreamInvalidError()
 	}
+	var accName string
 	c.mu.Lock()
 	s, a := c.srv, c.acc
+	if a != nil {
+		accName = a.Name
+	}
 	c.mu.Unlock()
 
 	// Hold mset lock here.
 	mset.mu.Lock()
-	if mset.client == nil || mset.store == nil {
+	if mset.client == nil || mset.store == nil || mset.consumers == nil {
 		mset.mu.Unlock()
 		return nil, errors.New("invalid stream")
 	}
 
 	// If this one is durable and already exists, we let that be ok as long as only updating what should be allowed.
+	var cName string
 	if isDurableConsumer(config) {
-		if eo, ok := mset.consumers[config.Durable]; ok {
+		cName = config.Durable
+	} else if config.Name != _EMPTY_ {
+		cName = config.Name
+	}
+	if cName != _EMPTY_ {
+		if eo, ok := mset.consumers[cName]; ok {
 			mset.mu.Unlock()
 			err := eo.updateConfig(config)
 			if err == nil {
@@ -511,8 +632,8 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	// than stream config we prefer the account limits to handle cases where account limits are
 	// updated during the lifecycle of the stream
 	maxc := mset.cfg.MaxConsumers
-	if maxc <= 0 || (mset.jsa.limits.MaxConsumers > 0 && mset.jsa.limits.MaxConsumers < maxc) {
-		maxc = mset.jsa.limits.MaxConsumers
+	if maxc <= 0 || (selectedLimits.MaxConsumers > 0 && selectedLimits.MaxConsumers < maxc) {
+		maxc = selectedLimits.MaxConsumers
 	}
 	if maxc > 0 && mset.numPublicConsumers() >= maxc {
 		mset.mu.Unlock()
@@ -532,9 +653,25 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 				mset.mu.Unlock()
 				return nil, NewJSConsumerWQMultipleUnfilteredError()
 			} else if !mset.partitionUnique(config.FilterSubject) {
-				// We have a partition but it is not unique amongst the others.
-				mset.mu.Unlock()
-				return nil, NewJSConsumerWQConsumerNotUniqueError()
+				// Prior to v2.9.7, on a stream with WorkQueue policy, the servers
+				// were not catching the error of having multiple consumers with
+				// overlapping filter subjects depending on the scope, for instance
+				// creating "foo.*.bar" and then "foo.>" was not detected, while
+				// "foo.>" and then "foo.*.bar" would have been. Failing here
+				// in recovery mode would leave the rejected consumer in a bad state,
+				// so we will simply warn here, asking the user to remove this
+				// consumer administratively. Otherwise, if this is the creation
+				// of a new consumer, we will return the error.
+				if isRecovering {
+					s.Warnf("Consumer %q > %q has a filter subject that overlaps "+
+						"with other consumers, which is not allowed for a stream "+
+						"with WorkQueue policy, it should be administratively deleted",
+						cfg.Name, cName)
+				} else {
+					// We have a partition but it is not unique amongst the others.
+					mset.mu.Unlock()
+					return nil, NewJSConsumerWQConsumerNotUniqueError()
+				}
 			}
 		}
 		if config.DeliverPolicy != DeliverAll {
@@ -545,22 +682,24 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 
 	// Set name, which will be durable name if set, otherwise we create one at random.
 	o := &consumer{
-		mset:    mset,
-		js:      s.getJetStream(),
-		acc:     a,
-		srv:     s,
-		client:  s.createInternalJetStreamClient(),
-		sysc:    s.createInternalJetStreamClient(),
-		cfg:     *config,
-		dsubj:   config.DeliverSubject,
-		outq:    mset.outq,
-		active:  true,
-		qch:     make(chan struct{}),
-		mch:     make(chan struct{}, 1),
-		sfreq:   int32(sampleFreq),
-		maxdc:   uint64(config.MaxDeliver),
-		maxp:    config.MaxAckPending,
-		created: time.Now().UTC(),
+		mset:      mset,
+		js:        s.getJetStream(),
+		acc:       a,
+		srv:       s,
+		client:    s.createInternalJetStreamClient(),
+		sysc:      s.createInternalJetStreamClient(),
+		cfg:       *config,
+		dsubj:     config.DeliverSubject,
+		outq:      mset.outq,
+		active:    true,
+		qch:       make(chan struct{}),
+		uch:       make(chan struct{}, 1),
+		mch:       make(chan struct{}, 1),
+		sfreq:     int32(sampleFreq),
+		maxdc:     uint64(config.MaxDeliver),
+		maxp:      config.MaxAckPending,
+		retention: retention,
+		created:   time.Now().UTC(),
 	}
 
 	// Bind internal client to the user account.
@@ -578,13 +717,22 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	} else if oname != _EMPTY_ {
 		o.name = oname
 	} else {
-		for {
-			o.name = createConsumerName()
-			if _, ok := mset.consumers[o.name]; !ok {
-				break
+		if config.Name != _EMPTY_ {
+			o.name = config.Name
+		} else {
+			// Legacy ephemeral auto-generated.
+			for {
+				o.name = createConsumerName()
+				if _, ok := mset.consumers[o.name]; !ok {
+					break
+				}
 			}
+			config.Name = o.name
 		}
 	}
+	// Create ackMsgs queue now that we have a consumer name
+	o.ackMsgs = s.newIPQueue(fmt.Sprintf("[ACC:%s] consumer '%s' on stream '%s' ackMsgs", accName, o.name, mset.cfg.Name))
+
 	// Create our request waiting queue.
 	if o.isPullMode() {
 		o.waiting = newWaitQueue(config.MaxWaiting)
@@ -598,6 +746,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	// already under lock, mset.Name() would deadlock
 	o.stream = mset.cfg.Name
 	o.ackEventT = JSMetricConsumerAckPre + "." + o.stream + "." + o.name
+	o.nakEventT = JSAdvisoryConsumerMsgNakPre + "." + o.stream + "." + o.name
 	o.deliveryExcEventT = JSAdvisoryConsumerMaxDeliveryExceedPre + "." + o.stream + "." + o.name
 
 	if !isValidName(o.name) {
@@ -606,9 +755,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		return nil, NewJSConsumerBadDurableNameError()
 	}
 
-	// Select starting sequence number
-	o.selectStartingSeqNo()
-
+	// Setup our storage if not a direct consumer.
 	if !config.Direct {
 		store, err := mset.store.ConsumerStore(o.name, config)
 		if err != nil {
@@ -617,6 +764,16 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 			return nil, NewJSConsumerStoreFailedError(err)
 		}
 		o.store = store
+	}
+
+	if o.store != nil && o.store.HasState() {
+		// Restore our saved state.
+		o.mu.Lock()
+		o.readStoredState(0)
+		o.mu.Unlock()
+	} else {
+		// Select starting sequence number
+		o.selectStartingSeqNo()
 	}
 
 	// Now register with mset and create the ack subscription.
@@ -655,15 +812,8 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	o.ackSubj = fmt.Sprintf("%s.*.*.*.*.*", pre)
 	o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, mn, o.name)
 
-	// If not durable determine the inactive threshold.
-	if !o.isDurable() {
-		if o.cfg.InactiveThreshold != 0 {
-			o.dthresh = o.cfg.InactiveThreshold
-		} else {
-			// Add in 1 sec of jitter above and beyond the default of 5s.
-			o.dthresh = JsDeleteWaitTimeDefault + time.Duration(rand.Int63n(1000))*time.Millisecond
-		}
-	}
+	// Check/update the inactive threshold
+	o.updateInactiveThreshold(&o.cfg)
 
 	if o.isPushMode() {
 		if !o.isDurable() {
@@ -695,7 +845,10 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	}
 
 	// This is always true in single server mode.
-	if o.isLeader() {
+	o.mu.RLock()
+	isLdr := o.isLeader()
+	o.mu.RUnlock()
+	if isLdr {
 		// Send advisory.
 		var suppress bool
 		if !s.standAloneMode() && ca == nil {
@@ -711,6 +864,30 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 	return o, nil
 }
 
+// Updates the consumer `dthresh` delete timer duration and set
+// cfg.InactiveThreshold to JsDeleteWaitTimeDefault for ephemerals
+// if not explicitly already specified by the user.
+// Lock should be held.
+func (o *consumer) updateInactiveThreshold(cfg *ConsumerConfig) {
+	// Ephemerals will always have inactive thresholds.
+	if !o.isDurable() && cfg.InactiveThreshold <= 0 {
+		// Add in 1 sec of jitter above and beyond the default of 5s.
+		o.dthresh = JsDeleteWaitTimeDefault + 100*time.Millisecond + time.Duration(rand.Int63n(900))*time.Millisecond
+		// Only stamp config with default sans jitter.
+		cfg.InactiveThreshold = JsDeleteWaitTimeDefault
+	} else if cfg.InactiveThreshold > 0 {
+		// Add in up to 1 sec of jitter if pull mode.
+		if o.isPullMode() {
+			o.dthresh = cfg.InactiveThreshold + 100*time.Millisecond + time.Duration(rand.Int63n(900))*time.Millisecond
+		} else {
+			o.dthresh = cfg.InactiveThreshold
+		}
+	} else if cfg.InactiveThreshold <= 0 {
+		// We accept InactiveThreshold be set to 0 (for durables)
+		o.dthresh = 0
+	}
+}
+
 func (o *consumer) consumerAssignment() *consumerAssignment {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
@@ -720,11 +897,25 @@ func (o *consumer) consumerAssignment() *consumerAssignment {
 func (o *consumer) setConsumerAssignment(ca *consumerAssignment) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
 	o.ca = ca
-	// Set our node.
-	if ca != nil {
-		o.node = ca.Group.node
+	if ca == nil {
+		return
 	}
+	// Set our node.
+	o.node = ca.Group.node
+
+	// Trigger update chan.
+	select {
+	case o.uch <- struct{}{}:
+	default:
+	}
+}
+
+func (o *consumer) updateC() <-chan struct{} {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.uch
 }
 
 // checkQueueInterest will check on our interest's queue group status.
@@ -745,6 +936,16 @@ func (o *consumer) checkQueueInterest() {
 				o.qgroup = string(sub.queue)
 			}
 		}
+	}
+}
+
+// clears our node if we have one. When we scale down to 1.
+func (o *consumer) clearNode() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.node != nil {
+		o.node.Delete()
+		o.node = nil
 	}
 }
 
@@ -769,12 +970,27 @@ func (o *consumer) setLeader(isLeader bool) {
 		}
 
 		mset.mu.RLock()
-		s, jsa, stream := mset.srv, mset.jsa, mset.cfg.Name
+		s, jsa, stream, lseq := mset.srv, mset.jsa, mset.cfg.Name, mset.lseq
 		mset.mu.RUnlock()
 
 		o.mu.Lock()
+		o.rdq, o.rdqi = nil, nil
+
 		// Restore our saved state. During non-leader status we just update our underlying store.
-		o.readStoredState()
+		o.readStoredState(lseq)
+
+		// Setup initial num pending.
+		o.streamNumPending()
+
+		// Cleanup lss when we take over in clustered mode.
+		if o.hasSkipListPending() && o.sseq >= o.lss.resume {
+			o.lss = nil
+		}
+
+		// Update the group on the our starting sequence if we are starting but we skipped some in the stream.
+		if o.dseq == 1 && o.sseq > 1 {
+			o.updateSkipped()
+		}
 
 		// Do info sub.
 		if o.infoSub == nil && jsa != nil {
@@ -784,7 +1000,7 @@ func (o *consumer) setLeader(isLeader bool) {
 		}
 
 		var err error
-		if o.ackSub, err = o.subscribeInternal(o.ackSubj, o.processAck); err != nil {
+		if o.ackSub, err = o.subscribeInternal(o.ackSubj, o.pushAck); err != nil {
 			o.mu.Unlock()
 			o.deleteWithoutAdvisory()
 			return
@@ -809,9 +1025,6 @@ func (o *consumer) setLeader(isLeader bool) {
 			}
 		}
 
-		// Setup initial pending and proper start sequence.
-		o.setInitialPendingAndStart()
-
 		// If push mode, register for notifications on interest.
 		if o.isPushMode() {
 			o.inch = make(chan bool, 8)
@@ -827,11 +1040,11 @@ func (o *consumer) setLeader(isLeader bool) {
 				stopAndClearTimer(&o.gwdtmr)
 				o.gwdtmr = time.AfterFunc(time.Second, func() { o.watchGWinterest() })
 			}
-		} else if !o.isDurable() {
-			// Ephemeral pull consumer. We run the dtmr all the time for this one.
-			if o.dtmr != nil {
-				stopAndClearTimer(&o.dtmr)
-			}
+		}
+
+		if o.dthresh > 0 && (o.isPullMode() || !o.active) {
+			// Pull consumer. We run the dtmr all the time for this one.
+			stopAndClearTimer(&o.dtmr)
 			o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
 		}
 
@@ -849,8 +1062,17 @@ func (o *consumer) setLeader(isLeader bool) {
 		}
 		o.mu.Unlock()
 
+		// Snapshot initial info.
+		o.infoWithSnap(true)
+
+		// Register as a leader with our parent stream.
+		mset.setConsumerAsLeader(o)
+
 		// Now start up Go routine to deliver msgs.
 		go o.loopAndGatherMsgs(qch)
+
+		// Now start up Go routine to process acks.
+		go o.processInboundAcks(qch)
 
 		// If we are R>1 spin up our proposal loop.
 		if node != nil {
@@ -864,33 +1086,43 @@ func (o *consumer) setLeader(isLeader bool) {
 	} else {
 		// Shutdown the go routines and the subscriptions.
 		o.mu.Lock()
-		o.unsubscribe(o.ackSub)
-		o.unsubscribe(o.reqSub)
-		o.unsubscribe(o.fcSub)
-		o.ackSub = nil
-		o.reqSub = nil
-		o.fcSub = nil
-		if o.infoSub != nil {
-			o.srv.sysUnsubscribe(o.infoSub)
-			o.infoSub = nil
-		}
 		if o.qch != nil {
 			close(o.qch)
 			o.qch = nil
 		}
+		// Make sure to clear out any re delivery queues
+		stopAndClearTimer(&o.ptmr)
+		o.rdq, o.rdqi = nil, nil
+		o.pending = nil
+		// ok if they are nil, we protect inside unsubscribe()
+		o.unsubscribe(o.ackSub)
+		o.unsubscribe(o.reqSub)
+		o.unsubscribe(o.fcSub)
+		o.ackSub, o.reqSub, o.fcSub = nil, nil, nil
+		if o.infoSub != nil {
+			o.srv.sysUnsubscribe(o.infoSub)
+			o.infoSub = nil
+		}
 		// Reset waiting if we are in pull mode.
 		if o.isPullMode() {
 			o.waiting = newWaitQueue(o.cfg.MaxWaiting)
+			if !o.isDurable() {
+				stopAndClearTimer(&o.dtmr)
+			}
+		} else if o.srv.gateway.enabled {
+			stopAndClearTimer(&o.gwdtmr)
 		}
 		o.mu.Unlock()
+
+		// Unregister as a leader with our parent stream.
+		if mset != nil {
+			mset.removeConsumerAsLeader(o)
+		}
 	}
 }
 
 func (o *consumer) handleClusterConsumerInfoRequest(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
-	o.mu.RLock()
-	sysc := o.sysc
-	o.mu.RUnlock()
-	sysc.sendInternalMsg(reply, _EMPTY_, nil, o.info())
+	o.infoWithSnapAndReply(false, reply)
 }
 
 // Lock should be held.
@@ -1053,16 +1285,18 @@ func (o *consumer) updateDeliveryInterest(localInterest bool) bool {
 	}
 
 	// If the delete timer has already been set do not clear here and return.
-	if o.dtmr != nil && !o.isDurable() && !interest {
+	// Note that durable can now have an inactive threshold, so don't check
+	// for durable status, instead check for dthresh > 0.
+	if o.dtmr != nil && o.dthresh > 0 && !interest {
 		return true
 	}
 
 	// Stop and clear the delete timer always.
 	stopAndClearTimer(&o.dtmr)
 
-	// If we do not have interest anymore and we are not durable start
+	// If we do not have interest anymore and have a delete threshold set, then set
 	// a timer to delete us. We wait for a bit in case of server reconnect.
-	if !o.isDurable() && !interest {
+	if !interest && o.dthresh > 0 {
 		o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
 		return true
 	}
@@ -1083,12 +1317,25 @@ func (o *consumer) deleteNotActive() {
 			return
 		}
 	} else {
-		// These need to keep firing so reset first.
-		if o.dtmr != nil {
-			o.dtmr.Reset(o.dthresh)
+		// Pull mode.
+		elapsed := time.Since(o.waiting.last)
+		if elapsed <= o.cfg.InactiveThreshold {
+			// These need to keep firing so reset but use delta.
+			if o.dtmr != nil {
+				o.dtmr.Reset(o.dthresh - elapsed)
+			} else {
+				o.dtmr = time.AfterFunc(o.dthresh-elapsed, func() { o.deleteNotActive() })
+			}
+			o.mu.Unlock()
+			return
 		}
-		// Check if we have had a request lately, or if we still have valid requests waiting.
-		if time.Since(o.waiting.last) <= o.dthresh || o.checkWaitingForInterest() {
+		// Check if we still have valid requests waiting.
+		if o.checkWaitingForInterest() {
+			if o.dtmr != nil {
+				o.dtmr.Reset(o.dthresh)
+			} else {
+				o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
+			}
 			o.mu.Unlock()
 			return
 		}
@@ -1114,7 +1361,6 @@ func (o *consumer) deleteNotActive() {
 			// Check to make sure we went away.
 			// Don't think this needs to be a monitored go routine.
 			go func() {
-				var fs bool
 				ticker := time.NewTicker(time.Second)
 				defer ticker.Stop()
 				for range ticker.C {
@@ -1122,11 +1368,8 @@ func (o *consumer) deleteNotActive() {
 					ca := js.consumerAssignment(acc, stream, name)
 					js.mu.RUnlock()
 					if ca != nil {
-						if fs {
-							s.Warnf("Consumer assignment not cleaned up, retrying")
-							meta.ForwardProposal(removeEntry)
-						}
-						fs = true
+						s.Warnf("Consumer assignment for '%s > %s > %s' not cleaned up, retrying", acc, stream, name)
+						meta.ForwardProposal(removeEntry)
 					} else {
 						return
 					}
@@ -1243,9 +1486,6 @@ func (acc *Account) checkNewConsumerConfig(cfg, ncfg *ConsumerConfig) error {
 		return nil
 	}
 	// Something different, so check since we only allow certain things to be updated.
-	if cfg.FilterSubject != ncfg.FilterSubject {
-		return errors.New("filter subject can not be updated")
-	}
 	if cfg.DeliverPolicy != ncfg.DeliverPolicy {
 		return errors.New("deliver policy can not be updated")
 	}
@@ -1267,6 +1507,9 @@ func (acc *Account) checkNewConsumerConfig(cfg, ncfg *ConsumerConfig) error {
 	if cfg.FlowControl != ncfg.FlowControl {
 		return errors.New("flow control can not be updated")
 	}
+	if cfg.MaxWaiting != ncfg.MaxWaiting {
+		return errors.New("max waiting can not be updated")
+	}
 
 	// Deliver Subject is conditional on if its bound.
 	if cfg.DeliverSubject != ncfg.DeliverSubject {
@@ -1280,6 +1523,11 @@ func (acc *Account) checkNewConsumerConfig(cfg, ncfg *ConsumerConfig) error {
 		if len(rr.psubs)+len(rr.qsubs) != 0 {
 			return NewJSConsumerNameExistError()
 		}
+	}
+
+	// Check if BackOff is defined, MaxDeliver is within range.
+	if lbo := len(ncfg.BackOff); lbo > 0 && ncfg.MaxDeliver <= lbo {
+		return NewJSConsumerMaxDeliverBackoffError()
 	}
 
 	return nil
@@ -1322,9 +1570,29 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 		// We need both locks here so do in Go routine.
 		go o.setRateLimitNeedsLocks()
 	}
+	if cfg.SampleFrequency != o.cfg.SampleFrequency {
+		s := strings.TrimSuffix(cfg.SampleFrequency, "%")
+		// String has been already verified for validity up in the stack, so no
+		// need to check for error here.
+		sampleFreq, _ := strconv.Atoi(s)
+		o.sfreq = int32(sampleFreq)
+	}
+	// Set MaxDeliver if changed
+	if cfg.MaxDeliver != o.cfg.MaxDeliver {
+		o.maxdc = uint64(cfg.MaxDeliver)
+	}
+	// Set InactiveThreshold if changed.
+	if val := cfg.InactiveThreshold; val != o.cfg.InactiveThreshold {
+		o.updateInactiveThreshold(cfg)
+		stopAndClearTimer(&o.dtmr)
+		// Restart timer only if we are the leader.
+		if o.isLeader() && o.dthresh > 0 {
+			o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
+		}
+	}
 
 	// Record new config for others that do not need special handling.
-	// Allowed but considered no-op, [Description, MaxDeliver, SampleFrequency, MaxWaiting, HeadersOnly]
+	// Allowed but considered no-op, [Description, SampleFrequency, MaxWaiting, HeadersOnly]
 	o.cfg = *cfg
 
 	return nil
@@ -1371,9 +1639,55 @@ func (o *consumer) sendAckReply(subj string) {
 	o.sendAdvisory(subj, nil)
 }
 
-// Process a message for the ack reply subject delivered with a message.
-func (o *consumer) processAck(_ *subscription, c *client, acc *Account, subject, reply string, rmsg []byte) {
-	_, msg := c.msgParts(rmsg)
+type jsAckMsg struct {
+	subject string
+	reply   string
+	hdr     int
+	msg     []byte
+}
+
+var jsAckMsgPool sync.Pool
+
+func newJSAckMsg(subj, reply string, hdr int, msg []byte) *jsAckMsg {
+	var m *jsAckMsg
+	am := jsAckMsgPool.Get()
+	if am != nil {
+		m = am.(*jsAckMsg)
+	} else {
+		m = &jsAckMsg{}
+	}
+	// When getting something from a pool it is criticical that all fields are
+	// initialized. Doing this way guarantees that if someone adds a field to
+	// the structure, the compiler will fail the build if this line is not updated.
+	(*m) = jsAckMsg{subj, reply, hdr, msg}
+	return m
+}
+
+func (am *jsAckMsg) returnToPool() {
+	if am == nil {
+		return
+	}
+	am.subject, am.reply, am.hdr, am.msg = _EMPTY_, _EMPTY_, -1, nil
+	jsAckMsgPool.Put(am)
+}
+
+// Push the ack message to the consumer's ackMsgs queue
+func (o *consumer) pushAck(_ *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	atomic.AddInt64(&o.awl, 1)
+	o.ackMsgs.push(newJSAckMsg(subject, reply, c.pa.hdr, copyBytes(rmsg)))
+}
+
+// Processes a message for the ack reply subject delivered with a message.
+func (o *consumer) processAck(subject, reply string, hdr int, rmsg []byte) {
+	defer atomic.AddInt64(&o.awl, -1)
+
+	var msg []byte
+	if hdr > 0 {
+		msg = rmsg[hdr:]
+	} else {
+		msg = rmsg
+	}
+
 	sseq, dseq, dc := ackReplyInfo(subject)
 
 	skipAckReply := sseq == 0
@@ -1383,16 +1697,7 @@ func (o *consumer) processAck(_ *subscription, c *client, acc *Account, subject,
 		o.processAckMsg(sseq, dseq, dc, true)
 	case bytes.HasPrefix(msg, AckNext):
 		o.processAckMsg(sseq, dseq, dc, true)
-		// processNextMsgReq can be invoked from an internal subscription or from here.
-		// Therefore, it has to call msgParts(), so we can't simply pass msg[len(AckNext):]
-		// with current c.pa.hdr because it would cause a panic.  We will save the current
-		// c.pa.hdr value and disable headers before calling processNextMsgReq and then
-		// restore so that we don't mess with the calling stack in case it is used
-		// somewhere else.
-		phdr := c.pa.hdr
-		c.pa.hdr = -1
-		o.processNextMsgReq(nil, c, acc, subject, reply, msg[len(AckNext):])
-		c.pa.hdr = phdr
+		o.processNextMsgRequest(reply, msg[len(AckNext):])
 		skipAckReply = true
 	case bytes.HasPrefix(msg, AckNak):
 		o.processNak(sseq, dseq, dc, msg)
@@ -1456,7 +1761,7 @@ func (o *consumer) loopAndForwardProposals(qch chan struct{}) {
 			sz += len(proposal.data)
 			if sz > maxBatch {
 				node.ProposeDirect(entries)
-				// We need to re-craete `entries` because there is a reference
+				// We need to re-create `entries` because there is a reference
 				// to it in the node's pae map.
 				sz, entries = 0, nil
 			}
@@ -1616,6 +1921,25 @@ func (o *consumer) checkPendingRequests() {
 	o.prm = nil
 }
 
+// This will release any pending pull requests if applicable.
+// Should be called only by the leader being deleted or stopped.
+// Lock should be held.
+func (o *consumer) releaseAnyPendingRequests() {
+	if o.mset == nil || o.outq == nil || o.waiting.len() == 0 {
+		return
+	}
+	hdr := []byte("NATS/1.0 409 Consumer Deleted\r\n\r\n")
+	wq := o.waiting
+	o.waiting = nil
+	for i, rp := 0, wq.rp; i < wq.n; i++ {
+		if wr := wq.reqs[rp]; wr != nil {
+			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+			wr.recycle()
+		}
+		rp = (rp + 1) % cap(wq.reqs)
+	}
+}
+
 // Process a NAK.
 func (o *consumer) processNak(sseq, dseq, dc uint64, nak []byte) {
 	o.mu.Lock()
@@ -1631,6 +1955,29 @@ func (o *consumer) processNak(sseq, dseq, dc uint64, nak []byte) {
 			return
 		}
 	}
+
+	// Deliver an advisory
+	e := JSConsumerDeliveryNakAdvisory{
+		TypedEvent: TypedEvent{
+			Type: JSConsumerDeliveryNakAdvisoryType,
+			ID:   nuid.Next(),
+			Time: time.Now().UTC(),
+		},
+		Stream:      o.stream,
+		Consumer:    o.name,
+		ConsumerSeq: dseq,
+		StreamSeq:   sseq,
+		Deliveries:  dc,
+		Domain:      o.srv.getOpts().JetStreamDomain,
+	}
+
+	j, err := json.Marshal(e)
+	if err != nil {
+		return
+	}
+
+	o.sendAdvisory(o.nakEventT, j)
+
 	// Check to see if we have delays attached.
 	if len(nak) > len(AckNak) {
 		arg := bytes.TrimSpace(nak[len(AckNak):])
@@ -1722,14 +2069,14 @@ func (o *consumer) ackWait(next time.Duration) time.Duration {
 }
 
 // Due to bug in calculation of sequences on restoring redelivered let's do quick sanity check.
-func (o *consumer) checkRedelivered() {
+func (o *consumer) checkRedelivered(slseq uint64) {
 	var lseq uint64
 	if mset := o.mset; mset != nil {
-		lseq = mset.lastSeq()
+		lseq = slseq
 	}
 	var shouldUpdateState bool
 	for sseq := range o.rdc {
-		if sseq < o.asflr || sseq > lseq {
+		if sseq < o.asflr || (lseq > 0 && sseq > lseq) {
 			delete(o.rdc, sseq)
 			o.removeFromRedeliverQueue(sseq)
 			shouldUpdateState = true
@@ -1742,28 +2089,33 @@ func (o *consumer) checkRedelivered() {
 
 // This will restore the state from disk.
 // Lock should be held.
-func (o *consumer) readStoredState() error {
+func (o *consumer) readStoredState(slseq uint64) error {
 	if o.store == nil {
 		return nil
 	}
 	state, err := o.store.State()
-	if err == nil && state != nil {
+	if err == nil {
 		o.applyState(state)
 		if len(o.rdc) > 0 {
-			o.checkRedelivered()
+			o.checkRedelivered(slseq)
 		}
 	}
 	return err
 }
 
 // Apply the consumer stored state.
+// Lock should be held.
 func (o *consumer) applyState(state *ConsumerState) {
 	if state == nil {
 		return
 	}
 
+	// If o.sseq is greater don't update. Don't go backwards on o.sseq.
+	if o.sseq <= state.Delivered.Stream {
+		o.sseq = state.Delivered.Stream + 1
+	}
 	o.dseq = state.Delivered.Consumer + 1
-	o.sseq = state.Delivered.Stream + 1
+
 	o.adflr = state.AckFloor.Consumer
 	o.asflr = state.AckFloor.Stream
 	o.pending = state.Pending
@@ -1782,17 +2134,8 @@ func (o *consumer) applyState(state *ConsumerState) {
 	}
 }
 
-func (o *consumer) readStoreState() *ConsumerState {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.store == nil {
-		return nil
-	}
-	state, _ := o.store.State()
-	return state
-}
-
 // Sets our store state from another source. Used in clustered mode on snapshot restore.
+// Lock should be held.
 func (o *consumer) setStoreState(state *ConsumerState) error {
 	if state == nil || o.store == nil {
 		return nil
@@ -1814,7 +2157,6 @@ func (o *consumer) writeStoreStateUnlocked() error {
 	if o.store == nil {
 		return nil
 	}
-
 	state := ConsumerState{
 		Delivered: SequencePair{
 			Consumer: o.dseq - 1,
@@ -1830,25 +2172,54 @@ func (o *consumer) writeStoreStateUnlocked() error {
 	return o.store.Update(&state)
 }
 
+// Returns an initial info. Only applicable for non-clustered consumers.
+// We will clear after we return it, so one shot.
+func (o *consumer) initialInfo() *ConsumerInfo {
+	o.mu.Lock()
+	ici := o.ici
+	o.ici = nil // gc friendly
+	o.mu.Unlock()
+	if ici == nil {
+		ici = o.info()
+	}
+	return ici
+}
+
+// Clears our initial info.
+// Used when we have a leader change in cluster mode but do not send a response.
+func (o *consumer) clearInitialInfo() {
+	o.mu.Lock()
+	o.ici = nil // gc friendly
+	o.mu.Unlock()
+}
+
 // Info returns our current consumer state.
 func (o *consumer) info() *ConsumerInfo {
-	o.mu.RLock()
+	return o.infoWithSnap(false)
+}
+
+func (o *consumer) infoWithSnap(snap bool) *ConsumerInfo {
+	return o.infoWithSnapAndReply(snap, _EMPTY_)
+}
+
+func (o *consumer) infoWithSnapAndReply(snap bool, reply string) *ConsumerInfo {
+	o.mu.Lock()
 	mset := o.mset
 	if mset == nil || mset.srv == nil {
-		o.mu.RUnlock()
+		o.mu.Unlock()
 		return nil
 	}
 	js := o.js
-	o.mu.RUnlock()
-
 	if js == nil {
+		o.mu.Unlock()
 		return nil
 	}
 
-	ci := js.clusterInfo(o.raftGroup())
-
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	// Capture raftGroup.
+	var rg *raftGroup
+	if o.ca != nil {
+		rg = o.ca.Group
+	}
 
 	cfg := o.cfg
 	info := &ConsumerInfo{
@@ -1866,9 +2237,8 @@ func (o *consumer) info() *ConsumerInfo {
 		},
 		NumAckPending:  len(o.pending),
 		NumRedelivered: len(o.rdc),
-		NumPending:     o.adjustedPending(),
+		NumPending:     o.streamNumPending(),
 		PushBound:      o.isPushMode() && o.active,
-		Cluster:        ci,
 	}
 	// Adjust active based on non-zero etc. Also make UTC here.
 	if !o.ldt.IsZero() {
@@ -1882,9 +2252,26 @@ func (o *consumer) info() *ConsumerInfo {
 
 	// If we are a pull mode consumer, report on number of waiting requests.
 	if o.isPullMode() {
-		o.expireWaiting()
+		o.processWaiting(false)
 		info.NumWaiting = o.waiting.len()
 	}
+	// If we were asked to snapshot do so here.
+	if snap {
+		o.ici = info
+	}
+	sysc := o.sysc
+	o.mu.Unlock()
+
+	// Do cluster.
+	if rg != nil {
+		info.Cluster = js.clusterInfo(rg)
+	}
+
+	// If we have a reply subject send the response here.
+	if reply != _EMPTY_ && sysc != nil {
+		sysc.sendInternalMsg(reply, _EMPTY_, nil, info)
+	}
+
 	return info
 }
 
@@ -2019,7 +2406,7 @@ func (o *consumer) processAckMsg(sseq, dseq, dc uint64, doSample bool) {
 		}
 	}
 
-	// If we had max ack pending set and were at limit we need to unblock folks.
+	// If we had max ack pending set and were at limit we need to unblock ourselves.
 	if needSignal {
 		o.signalNewMessages()
 	}
@@ -2038,19 +2425,37 @@ func (o *consumer) isFiltered() bool {
 	if mset == nil {
 		return true
 	}
-	if len(mset.cfg.Subjects) > 1 {
-		return true
+	if len(mset.cfg.Subjects) == 1 {
+		return o.cfg.FilterSubject != mset.cfg.Subjects[0]
 	}
-	return o.cfg.FilterSubject != mset.cfg.Subjects[0]
+	// All else return true.
+	return true
 }
 
 // Check if we need an ack for this store seq.
 // This is called for interest based retention streams to remove messages.
-func (o *consumer) needAck(sseq uint64) bool {
+func (o *consumer) needAck(sseq uint64, subj string) bool {
 	var needAck bool
 	var asflr, osseq uint64
 	var pending map[uint64]*Pending
 	o.mu.RLock()
+
+	// Check if we are filtered, and if so check if this is even applicable to us.
+	if o.isFiltered() && o.mset != nil {
+		if subj == _EMPTY_ {
+			var svp StoreMsg
+			if _, err := o.mset.store.LoadMsg(sseq, &svp); err != nil {
+				o.mu.RUnlock()
+				return false
+			}
+			subj = svp.subj
+		}
+		if !o.isFilteredMatch(subj) {
+			o.mu.RUnlock()
+			return false
+		}
+	}
+
 	if o.isLeader() {
 		asflr, osseq = o.asflr, o.sseq
 		pending = o.pending
@@ -2059,60 +2464,65 @@ func (o *consumer) needAck(sseq uint64) bool {
 			o.mu.RUnlock()
 			return false
 		}
-		state, err := o.store.State()
+		state, err := o.store.BorrowState()
 		if err != nil || state == nil {
 			// Fall back to what we track internally for now.
 			needAck := sseq > o.asflr && !o.isFiltered()
 			o.mu.RUnlock()
 			return needAck
 		}
-		asflr, osseq = state.AckFloor.Stream, o.sseq
-		pending = state.Pending
+		// If loading state as here, the osseq is +1.
+		asflr, osseq, pending = state.AckFloor.Stream, state.Delivered.Stream+1, state.Pending
 	}
+
 	switch o.cfg.AckPolicy {
 	case AckNone, AckAll:
 		needAck = sseq > asflr
 	case AckExplicit:
 		if sseq > asflr {
-			// Generally this means we need an ack, but just double check pending acks.
-			needAck = true
-			if sseq < osseq {
-				if len(pending) == 0 {
-					needAck = false
-				} else {
-					_, needAck = pending[sseq]
-				}
+			if sseq >= osseq {
+				needAck = true
+			} else {
+				_, needAck = pending[sseq]
 			}
 		}
 	}
+
 	o.mu.RUnlock()
 	return needAck
 }
 
 // Helper for the next message requests.
-func nextReqFromMsg(msg []byte) (time.Time, int, bool, error) {
+func nextReqFromMsg(msg []byte) (time.Time, int, int, bool, time.Duration, time.Time, error) {
 	req := bytes.TrimSpace(msg)
 
 	switch {
 	case len(req) == 0:
-		return time.Time{}, 1, false, nil
+		return time.Time{}, 1, 0, false, 0, time.Time{}, nil
 
 	case req[0] == '{':
 		var cr JSApiConsumerGetNextRequest
 		if err := json.Unmarshal(req, &cr); err != nil {
-			return time.Time{}, -1, false, err
+			return time.Time{}, -1, 0, false, 0, time.Time{}, err
+		}
+		var hbt time.Time
+		if cr.Heartbeat > 0 {
+			if cr.Heartbeat*2 > cr.Expires {
+				return time.Time{}, 1, 0, false, 0, time.Time{}, errors.New("heartbeat value too large")
+			}
+			hbt = time.Now().Add(cr.Heartbeat)
 		}
 		if cr.Expires == time.Duration(0) {
-			return time.Time{}, cr.Batch, cr.NoWait, nil
+			return time.Time{}, cr.Batch, cr.MaxBytes, cr.NoWait, cr.Heartbeat, hbt, nil
 		}
-		return time.Now().Add(cr.Expires), cr.Batch, cr.NoWait, nil
+		return time.Now().Add(cr.Expires), cr.Batch, cr.MaxBytes, cr.NoWait, cr.Heartbeat, hbt, nil
 	default:
 		if n, err := strconv.Atoi(string(req)); err == nil {
-			return time.Time{}, n, false, nil
+			return time.Time{}, n, 0, false, 0, time.Time{}, nil
 		}
 	}
 
-	return time.Time{}, 1, false, nil
+	return time.Time{}, 1, 0, false, 0, time.Time{}, nil
 }
 
 // Represents a request that is on the internal waiting queue
@@ -2122,8 +2532,11 @@ type waitingRequest struct {
 	reply    string
 	n        int // For batching
 	d        int
+	b        int // For max bytes tracking.
 	expires  time.Time
 	received time.Time
+	hb       time.Duration
+	hbt      time.Time
 	noWait   bool
 }
 
@@ -2137,8 +2550,7 @@ var wrPool = sync.Pool{
 // Recycle this request. This request can not be accessed after this call.
 func (wr *waitingRequest) recycleIfDone() bool {
 	if wr != nil && wr.n <= 0 {
-		wr.acc, wr.interest, wr.reply = nil, _EMPTY_, _EMPTY_
-		wrPool.Put(wr)
+		wr.recycle()
 		return true
 	}
 	return false
@@ -2154,10 +2566,9 @@ func (wr *waitingRequest) recycle() {
 
 // waiting queue for requests that are waiting for new messages to arrive.
 type waitQueue struct {
-	rp, wp int
-	last   time.Time
-	fexp   time.Time
-	reqs   []*waitingRequest
+	rp, wp, n int
+	last      time.Time
+	reqs      []*waitingRequest
 }
 
 // Create a new ring buffer with at most max items.
@@ -2188,15 +2599,12 @@ func (wq *waitQueue) add(wr *waitingRequest) error {
 	}
 	// Track last active via when we receive a request.
 	wq.last = wr.received
-	// Track next to expire for all pending requests.
-	if !wr.expires.IsZero() && (wq.fexp.IsZero() || wr.expires.Before(wq.fexp)) {
-		wq.fexp = wr.expires
-	}
+	wq.n++
 	return nil
 }
 
 func (wq *waitQueue) isFull() bool {
-	return wq.rp == wq.wp
+	return wq.n == cap(wq.reqs)
 }
 
 func (wq *waitQueue) isEmpty() bool {
@@ -2204,13 +2612,10 @@ func (wq *waitQueue) isEmpty() bool {
 }
 
 func (wq *waitQueue) len() int {
-	if wq == nil || wq.rp < 0 {
+	if wq == nil {
 		return 0
 	}
-	if wq.rp < wq.wp {
-		return wq.wp - wq.rp
-	}
-	return cap(wq.reqs) - wq.rp + wq.wp
+	return wq.n
 }
 
 // Peek will return the next request waiting or nil if empty.
@@ -2226,12 +2631,19 @@ func (wq *waitQueue) peek() *waitingRequest {
 }
 
 // pop will return the next request and move the read cursor.
+// This will now place a request that still has pending items at the ends of the list.
 func (wq *waitQueue) pop() *waitingRequest {
 	wr := wq.peek()
 	if wr != nil {
 		wr.d++
 		wr.n--
-		if wr.n <= 0 {
+
+		// Always remove current now on a pop, and move to end if still valid.
+		// If we were the only one don't need to remove since this can be a no-op.
+		if wr.n > 0 && wq.n > 1 {
+			wq.removeCurrent()
+			wq.add(wr)
+		} else if wr.n <= 0 {
 			wq.removeCurrent()
 		}
 	}
@@ -2245,8 +2657,9 @@ func (wq *waitQueue) removeCurrent() {
 	}
 	wq.reqs[wq.rp] = nil
 	wq.rp = (wq.rp + 1) % cap(wq.reqs)
+	wq.n--
 	// Check if we are empty.
-	if wq.rp == wq.wp {
+	if wq.n == 0 {
 		wq.rp, wq.wp = -1, 0
 	}
 }
@@ -2257,57 +2670,83 @@ func (wq *waitQueue) compact() {
 		return
 	}
 	nreqs, i := make([]*waitingRequest, cap(wq.reqs)), 0
-	for rp := wq.rp; rp != wq.wp; rp = (rp + 1) % cap(wq.reqs) {
+	for j, rp := 0, wq.rp; j < wq.n; j++ {
 		if wr := wq.reqs[rp]; wr != nil {
 			nreqs[i] = wr
 			i++
 		}
+		rp = (rp + 1) % cap(wq.reqs)
 	}
 	// Reset here.
-	wq.rp, wq.wp, wq.reqs = 0, i, nreqs
+	wq.rp, wq.wp, wq.n, wq.reqs = 0, i, i, nreqs
 }
 
-// Return the replies for our pending requests.
+// Return the map of pending requests keyed by the reply subject.
 // No-op if push consumer or invalid etc.
-func (o *consumer) pendingRequestReplies() []string {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
+func (o *consumer) pendingRequests() map[string]*waitingRequest {
 	if o.waiting == nil {
 		return nil
 	}
-	wq, m := o.waiting, make(map[string]struct{})
-	for rp := o.waiting.rp; o.waiting.rp >= 0 && rp != wq.wp; rp = (rp + 1) % cap(wq.reqs) {
+	wq, m := o.waiting, make(map[string]*waitingRequest)
+	for i, rp := 0, wq.rp; i < wq.n; i++ {
 		if wr := wq.reqs[rp]; wr != nil {
-			m[wr.reply] = struct{}{}
+			m[wr.reply] = wr
 		}
+		rp = (rp + 1) % cap(wq.reqs)
 	}
-	var replies []string
-	for reply := range m {
-		replies = append(replies, reply)
-	}
-	return replies
+	return m
 }
 
 // Return next waiting request. This will check for expirations but not noWait or interest.
-// That will be handled by expireWaiting.
+// That will be handled by processWaiting.
 // Lock should be held.
-func (o *consumer) nextWaiting() *waitingRequest {
+func (o *consumer) nextWaiting(sz int) *waitingRequest {
 	if o.waiting == nil || o.waiting.isEmpty() {
 		return nil
 	}
 	for wr := o.waiting.peek(); !o.waiting.isEmpty(); wr = o.waiting.peek() {
-		if wr == nil || wr.expires.IsZero() || time.Now().Before(wr.expires) {
+		if wr == nil {
+			break
+		}
+		// Check if we have max bytes set.
+		if wr.b > 0 {
+			if sz <= wr.b {
+				wr.b -= sz
+				// If we are right now at zero, set batch to 1 to deliver this one but stop after.
+				if wr.b == 0 {
+					wr.n = 1
+				}
+			} else {
+				// Since we can't send that message to the requestor, we need to
+				// notify that we are closing the request.
+				const maxBytesT = "NATS/1.0 409 Message Size Exceeds MaxBytes\r\n%s: %d\r\n%s: %d\r\n\r\n"
+				hdr := []byte(fmt.Sprintf(maxBytesT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+				// Remove the current one, no longer valid due to max bytes limit.
+				o.waiting.removeCurrent()
+				if o.node != nil {
+					o.removeClusterPendingRequest(wr.reply)
+				}
+				wr.recycle()
+				continue
+			}
+		}
+
+		if wr.expires.IsZero() || time.Now().Before(wr.expires) {
 			rr := wr.acc.sl.Match(wr.interest)
 			if len(rr.psubs)+len(rr.qsubs) > 0 {
 				return o.waiting.pop()
-			} else if o.srv.gateway.enabled {
-				if o.srv.hasGatewayInterest(wr.acc.Name, wr.interest) || time.Since(wr.received) < defaultGatewayRecentSubExpiration {
-					return o.waiting.pop()
-				}
+			} else if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
+				return o.waiting.pop()
+			} else if o.srv.gateway.enabled && o.srv.hasGatewayInterest(wr.acc.Name, wr.interest) {
+				return o.waiting.pop()
 			}
 		}
-		hdr := []byte("NATS/1.0 408 Request Timeout\r\n\r\n")
-		o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		if wr.interest != wr.reply {
+			const intExpT = "NATS/1.0 408 Interest Expired\r\n%s: %d\r\n%s: %d\r\n\r\n"
+			hdr := []byte(fmt.Sprintf(intExpT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
+			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		}
 		// Remove the current one, no longer valid.
 		o.waiting.removeCurrent()
 		if o.node != nil {
@@ -2327,6 +2766,22 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 	}
 	_, msg = c.msgParts(msg)
 
+	inlineOk := c.kind != ROUTER && c.kind != GATEWAY && c.kind != LEAF
+	if !inlineOk {
+		// Check how long we have been away from the readloop for the route or gateway or leafnode.
+		// If too long move to a separate go routine.
+		if elapsed := time.Since(c.in.start); elapsed < noBlockThresh {
+			inlineOk = true
+		}
+	}
+	if inlineOk {
+		o.processNextMsgRequest(reply, msg)
+	} else {
+		go o.processNextMsgRequest(reply, copyBytes(msg))
+	}
+}
+
+func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -2346,7 +2801,7 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 	}
 
 	// Check payload here to see if they sent in batch size or a formal request.
-	expires, batchSize, noWait, err := nextReqFromMsg(msg)
+	expires, batchSize, maxBytes, noWait, hb, hbt, err := nextReqFromMsg(msg)
 	if err != nil {
 		sendErr(400, fmt.Sprintf("Bad Request - %v", err))
 		return
@@ -2363,27 +2818,31 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 		return
 	}
 
+	if maxBytes > 0 && o.cfg.MaxRequestMaxBytes > 0 && maxBytes > o.cfg.MaxRequestMaxBytes {
+		sendErr(409, fmt.Sprintf("Exceeded MaxRequestMaxBytes of %v", o.cfg.MaxRequestMaxBytes))
+		return
+	}
+
 	// If we have the max number of requests already pending try to expire.
 	if o.waiting.isFull() {
 		// Try to expire some of the requests.
-		if expired, _, _ := o.expireWaiting(); expired == 0 {
-			// Force expiration if needed.
-			o.forceExpireFirstWaiting()
-		}
+		o.processWaiting(false)
 	}
 
 	// If the request is for noWait and we have pending requests already, check if we have room.
 	if noWait {
-		msgsPending := o.adjustedPending() + uint64(len(o.rdq))
+		msgsPending := o.numPending() + uint64(len(o.rdq))
 		// If no pending at all, decide what to do with request.
 		// If no expires was set then fail.
 		if msgsPending == 0 && expires.IsZero() {
+			o.waiting.last = time.Now()
 			sendErr(404, "No Messages")
 			return
 		}
 		if msgsPending > 0 {
-			_, _, batchPending := o.expireWaiting()
+			_, _, batchPending, _ := o.processWaiting(false)
 			if msgsPending < uint64(batchPending) {
+				o.waiting.last = time.Now()
 				sendErr(408, "Requests Pending")
 				return
 			}
@@ -2393,18 +2852,12 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 	}
 
 	// If we receive this request though an account export, we need to track that interest subject and account.
-	acc, interest := o.acc, reply
-	for strings.HasPrefix(interest, replyPrefix) && acc.exports.responses != nil {
-		if si := acc.exports.responses[interest]; si != nil {
-			acc, interest = si.acc, si.to
-		} else {
-			break
-		}
-	}
+	acc, interest := trackDownAccountAndInterest(o.acc, reply)
 
-	// In case we have to queue up this request.
+	// Create a waiting request.
 	wr := wrPool.Get().(*waitingRequest)
-	wr.acc, wr.interest, wr.reply, wr.n, wr.d, wr.noWait, wr.expires = acc, interest, reply, batchSize, 0, noWait, expires
+	wr.acc, wr.interest, wr.reply, wr.n, wr.d, wr.noWait, wr.expires, wr.hb, wr.hbt = acc, interest, reply, batchSize, 0, noWait, expires, hb, hbt
+	wr.b = maxBytes
 	wr.received = time.Now()
 
 	if err := o.waiting.add(wr); err != nil {
@@ -2416,6 +2869,25 @@ func (o *consumer) processNextMsgReq(_ *subscription, c *client, _ *Account, _, 
 	if o.node != nil {
 		o.addClusterPendingRequest(wr.reply)
 	}
+}
+
+func trackDownAccountAndInterest(acc *Account, interest string) (*Account, string) {
+	for strings.HasPrefix(interest, replyPrefix) {
+		oa := acc
+		oa.mu.RLock()
+		if oa.exports.responses == nil {
+			oa.mu.RUnlock()
+			break
+		}
+		si := oa.exports.responses[interest]
+		if si == nil {
+			oa.mu.RUnlock()
+			break
+		}
+		acc, interest = si.acc, si.to
+		oa.mu.RUnlock()
+	}
+	return acc, interest
 }
 
 // Increase the delivery count for this message.
@@ -2476,23 +2948,14 @@ var (
 // Get next available message from underlying store.
 // Is partition aware and redeliver aware.
 // Lock should be held.
-func (o *consumer) getNextMsg() (subj string, hdr, msg []byte, seq uint64, dc uint64, ts int64, err error) {
+func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 	if o.mset == nil || o.mset.store == nil {
-		return _EMPTY_, nil, nil, 0, 0, 0, errBadConsumer
+		return nil, 0, errBadConsumer
 	}
-	for {
-		seq, dc := o.sseq, uint64(1)
-		if o.hasSkipListPending() {
-			seq = o.lss.seqs[0]
-			if len(o.lss.seqs) == 1 {
-				o.sseq = o.lss.resume
-				o.lss = nil
-				o.updateSkipped()
-			} else {
-				o.lss.seqs = o.lss.seqs[1:]
-			}
-		} else if o.hasRedeliveries() {
-			seq = o.getNextToRedeliver()
+	seq, dc := o.sseq, uint64(1)
+	// Process redelivered messages before looking at possibly "skip list" (deliver last per subject)
+	if o.hasRedeliveries() {
+		for seq = o.getNextToRedeliver(); seq > 0; seq = o.getNextToRedeliver() {
 			dc = o.incDeliveryCount(seq)
 			if o.maxdc > 0 && dc > o.maxdc {
 				// Only send once
@@ -2503,59 +2966,64 @@ func (o *consumer) getNextMsg() (subj string, hdr, msg []byte, seq uint64, dc ui
 				delete(o.pending, seq)
 				continue
 			}
-		} else if o.maxp > 0 && len(o.pending) >= o.maxp {
-			// maxp only set when ack policy != AckNone and user set MaxAckPending
-			// Stall if we have hit max pending.
-			return _EMPTY_, nil, nil, 0, 0, 0, errMaxAckPending
-		}
-
-		subj, hdr, msg, ts, err := o.mset.store.LoadMsg(seq)
-		if err == nil {
-			if dc == 1 { // First delivery.
-				o.sseq++
-				if o.cfg.FilterSubject != _EMPTY_ && !o.isFilteredMatch(subj) {
-					o.updateSkipped()
-					continue
+			if seq > 0 {
+				pmsg := getJSPubMsgFromPool()
+				sm, err := o.mset.store.LoadMsg(seq, &pmsg.StoreMsg)
+				if sm == nil || err != nil {
+					pmsg.returnToPool()
+					pmsg, dc = nil, 0
 				}
+				return pmsg, dc, err
 			}
-			// We have the msg here.
-			return subj, hdr, msg, seq, dc, ts, nil
 		}
-		// We got an error here. If this is an EOF we will return, otherwise
-		// we can continue looking.
-		if err == ErrStoreEOF || err == ErrStoreClosed || err == errNoCache || err == errPartialCache {
-			return _EMPTY_, nil, nil, 0, 0, 0, err
-		}
-		// Skip since its deleted or expired.
-		o.sseq++
+		// Fallback if all redeliveries are gone.
+		seq, dc = o.sseq, 1
 	}
-}
+	// Don't make it a "else" because it is possible that there were redeliveries
+	// but we exhausted the redelivery count and are back to try deliver the next message.
+	if o.hasSkipListPending() {
+		seq = o.lss.seqs[0]
+		if len(o.lss.seqs) == 1 {
+			o.sseq = o.lss.resume
+			o.lss = nil
+			o.updateSkipped()
+		} else {
+			o.lss.seqs = o.lss.seqs[1:]
+		}
+	}
 
-// forceExpireFirstWaiting will force expire the first waiting.
-// Lock should be held.
-func (o *consumer) forceExpireFirstWaiting() {
-	// FIXME(dlc) - Should we do advisory here as well?
-	wr := o.waiting.peek()
-	if wr == nil {
-		return
+	// Check if we have max pending.
+	if o.maxp > 0 && len(o.pending) >= o.maxp {
+		// maxp only set when ack policy != AckNone and user set MaxAckPending
+		// Stall if we have hit max pending.
+		return nil, 0, errMaxAckPending
 	}
-	// If we are expiring this and we think there is still interest, alert.
-	if rr := wr.acc.sl.Match(wr.interest); len(rr.psubs)+len(rr.qsubs) > 0 && o.mset != nil {
-		// We still appear to have interest, so send alert as courtesy.
-		hdr := []byte("NATS/1.0 408 Request Canceled\r\n\r\n")
-		o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+
+	// Grab next message applicable to us.
+	pmsg := getJSPubMsgFromPool()
+	sm, sseq, err := o.mset.store.LoadNextMsg(o.cfg.FilterSubject, o.filterWC, seq, &pmsg.StoreMsg)
+
+	if sseq >= o.sseq {
+		o.sseq = sseq + 1
+		if err == ErrStoreEOF {
+			o.updateSkipped()
+		}
 	}
-	o.waiting.removeCurrent()
-	if o.node != nil {
-		o.removeClusterPendingRequest(wr.reply)
+
+	if sm == nil {
+		pmsg.returnToPool()
+		return nil, 0, err
 	}
-	wr.recycle()
+
+	return pmsg, dc, err
 }
 
 // Will check for expiration and lack of interest on waiting requests.
-func (o *consumer) expireWaiting() (int, int, int) {
+// Will also do any heartbeats and return the next expiration or HB interval.
+func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
+	var fexp time.Time
 	if o.srv == nil || o.waiting.isEmpty() {
-		return 0, 0, 0
+		return 0, 0, 0, fexp
 	}
 
 	var expired, brp int
@@ -2578,37 +3046,51 @@ func (o *consumer) expireWaiting() (int, int, int) {
 	}
 
 	wq := o.waiting
-	wq.fexp = time.Time{}
-
-	for rp := o.waiting.rp; o.waiting.rp >= 0 && rp != wq.wp; rp = (rp + 1) % cap(wq.reqs) {
+	for i, rp, n := 0, wq.rp, wq.n; i < n; rp = (rp + 1) % cap(wq.reqs) {
 		wr := wq.reqs[rp]
 		// Check expiration.
-		if (wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
-			hdr := []byte("NATS/1.0 408 Request Timeout\r\n\r\n")
+		if (eos && wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
+			hdr := []byte(fmt.Sprintf("NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b))
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 			remove(wr, rp)
+			i++
 			continue
 		}
 		// Now check interest.
 		rr := wr.acc.sl.Match(wr.interest)
 		interest := len(rr.psubs)+len(rr.qsubs) > 0
-		if !interest && s.gateway.enabled {
-			// If we are here check on gateways.
+		if !interest && (s.leafNodeEnabled || s.gateway.enabled) {
+			// If we are here check on gateways and leaf nodes (as they can mask gateways on the other end).
 			// If we have interest or the request is too young break and do not expire.
-			if s.hasGatewayInterest(wr.acc.Name, wr.interest) || time.Since(wr.received) < defaultGatewayRecentSubExpiration {
+			if time.Since(wr.received) < defaultGatewayRecentSubExpiration {
+				interest = true
+			} else if s.gateway.enabled && s.hasGatewayInterest(wr.acc.Name, wr.interest) {
 				interest = true
 			}
 		}
 		// If interest, update batch pending requests counter and update fexp timer.
 		if interest {
 			brp += wr.n
-			if !wr.expires.IsZero() && (wq.fexp.IsZero() || wr.expires.Before(wq.fexp)) {
-				wq.fexp = wr.expires
+			if !wr.hbt.IsZero() {
+				if now.After(wr.hbt) {
+					// Fire off a heartbeat here.
+					o.sendIdleHeartbeat(wr.reply)
+					// Update next HB.
+					wr.hbt = now.Add(wr.hb)
+				}
+				if fexp.IsZero() || wr.hbt.Before(fexp) {
+					fexp = wr.hbt
+				}
 			}
+			if !wr.expires.IsZero() && (fexp.IsZero() || wr.expires.Before(fexp)) {
+				fexp = wr.expires
+			}
+			i++
 			continue
 		}
 		// No more interest here so go ahead and remove this one from our list.
 		remove(wr, rp)
+		i++
 	}
 
 	// If we have interior deletes from out of order invalidation, compact the waiting queue.
@@ -2616,12 +3098,12 @@ func (o *consumer) expireWaiting() (int, int, int) {
 		o.waiting.compact()
 	}
 
-	return expired, o.waiting.len(), brp
+	return expired, wq.len(), brp, fexp
 }
 
 // Will check to make sure those waiting still have registered interest.
 func (o *consumer) checkWaitingForInterest() bool {
-	o.expireWaiting()
+	o.processWaiting(true)
 	return o.waiting.len() > 0
 }
 
@@ -2633,6 +3115,53 @@ func (o *consumer) hbTimer() (time.Duration, *time.Timer) {
 	return o.cfg.Heartbeat, time.NewTimer(o.cfg.Heartbeat)
 }
 
+func (o *consumer) processInboundAcks(qch chan struct{}) {
+	// Grab the server lock to watch for server quit.
+	o.mu.RLock()
+	s := o.srv
+	hasInactiveThresh := o.cfg.InactiveThreshold > 0
+	o.mu.RUnlock()
+
+	for {
+		select {
+		case <-o.ackMsgs.ch:
+			acks := o.ackMsgs.pop()
+			for _, acki := range acks {
+				ack := acki.(*jsAckMsg)
+				o.processAck(ack.subject, ack.reply, ack.hdr, ack.msg)
+				ack.returnToPool()
+			}
+			o.ackMsgs.recycle(&acks)
+			// If we have an inactiveThreshold set, mark our activity.
+			if hasInactiveThresh {
+				o.suppressDeletion()
+			}
+		case <-qch:
+			return
+		case <-s.quitCh:
+			return
+		}
+	}
+}
+
+// Suppress auto cleanup on ack activity of any kind.
+func (o *consumer) suppressDeletion() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.closed {
+		return
+	}
+
+	if o.isPushMode() && o.dtmr != nil {
+		// if dtmr is not nil we have started the countdown, simply reset to threshold.
+		o.dtmr.Reset(o.dthresh)
+	} else if o.isPullMode() && o.waiting != nil {
+		// Pull mode always has timer running, just update last on waiting queue.
+		o.waiting.last = time.Now()
+	}
+}
+
 func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	// On startup check to see if we are in a a reply situation where replay policy is not instant.
 	var (
@@ -2640,15 +3169,24 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		lseq uint64
 	)
 
+	o.mu.RLock()
+	mset := o.mset
+	getLSeq := o.replay
+	o.mu.RUnlock()
+	// consumer is closed when mset is set to nil.
+	if mset == nil {
+		return
+	}
+	if getLSeq {
+		lseq = mset.state().LastSeq
+	}
+
 	o.mu.Lock()
 	s := o.srv
-	if o.replay {
-		// consumer is closed when mset is set to nil.
-		if o.mset == nil {
-			o.mu.Unlock()
-			return
-		}
-		lseq = o.mset.state().LastSeq
+	// need to check again if consumer is closed
+	if o.mset == nil {
+		o.mu.Unlock()
+		return
 	}
 	// For idle heartbeat support.
 	var hbc <-chan time.Time
@@ -2660,24 +3198,32 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	inch := o.inch
 	o.mu.Unlock()
 
+	// Grab the stream's retention policy
+	mset.mu.RLock()
+	rp := mset.cfg.Retention
+	mset.mu.RUnlock()
+
+	var err error
+
 	// Deliver all the msgs we have now, once done or on a condition, we wait for new ones.
 	for {
 		var (
-			seq, dc     uint64
-			subj, dsubj string
-			hdr         []byte
-			msg         []byte
-			err         error
-			ts          int64
-			delay       time.Duration
+			pmsg     *jsPubMsg
+			dc       uint64
+			dsubj    string
+			ackReply string
+			delay    time.Duration
+			sz       int
 		)
-
 		o.mu.Lock()
 		// consumer is closed when mset is set to nil.
 		if o.mset == nil {
 			o.mu.Unlock()
 			return
 		}
+
+		// Clear last error.
+		err = nil
 
 		// If we are in push mode and not active or under flowcontrol let's stop sending.
 		if o.isPushMode() {
@@ -2689,10 +3235,11 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			goto waitForMsgs
 		}
 
-		subj, hdr, msg, seq, dc, ts, err = o.getNextMsg()
+		// Grab our next msg.
+		pmsg, dc, err = o.getNextMsg()
 
 		// On error either wait or return.
-		if err != nil {
+		if err != nil || pmsg == nil {
 			if err == ErrStoreMsgNotFound || err == ErrStoreEOF || err == errMaxAckPending || err == errPartialCache {
 				goto waitForMsgs
 			} else {
@@ -2701,25 +3248,48 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			}
 		}
 
+		// Update our cached num pending here first.
+		if dc == 1 && o.npcm > 0 {
+			o.npc--
+		}
+		// Pre-calculate ackReply
+		ackReply = o.ackReply(pmsg.seq, o.dseq, dc, pmsg.ts, o.numPending())
+
+		// If headers only do not send msg payload.
+		// Add in msg size itself as header.
+		if o.cfg.HeadersOnly {
+			convertToHeadersOnly(pmsg)
+		}
+		// Calculate payload size. This can be calculated on client side.
+		// We do not include transport subject here since not generally known on client.
+		sz = len(pmsg.subj) + len(ackReply) + len(pmsg.hdr) + len(pmsg.msg)
+
 		if o.isPushMode() {
 			dsubj = o.dsubj
-		} else if wr := o.nextWaiting(); wr != nil {
+		} else if wr := o.nextWaiting(sz); wr != nil {
 			dsubj = wr.reply
-			if wr.recycleIfDone() && o.node != nil {
+			if done := wr.recycleIfDone(); done && o.node != nil {
 				o.removeClusterPendingRequest(dsubj)
+			} else if !done && wr.hb > 0 {
+				wr.hbt = time.Now().Add(wr.hb)
 			}
 		} else {
 			// We will redo this one.
 			o.sseq--
+			if dc == 1 && o.npcm > 0 {
+				o.npc++
+			}
+			pmsg.returnToPool()
 			goto waitForMsgs
 		}
 
 		// If we are in a replay scenario and have not caught up check if we need to delay here.
 		if o.replay && lts > 0 {
-			if delay = time.Duration(ts - lts); delay > time.Millisecond {
+			if delay = time.Duration(pmsg.ts - lts); delay > time.Millisecond {
 				o.mu.Unlock()
 				select {
 				case <-qch:
+					pmsg.returnToPool()
 					return
 				case <-time.After(delay):
 				}
@@ -2728,17 +3298,18 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		}
 
 		// Track this regardless.
-		lts = ts
+		lts = pmsg.ts
 
 		// If we have a rate limit set make sure we check that here.
 		if o.rlimit != nil {
 			now := time.Now()
-			r := o.rlimit.ReserveN(now, len(msg)+len(hdr)+len(subj)+len(dsubj)+len(o.ackReplyT))
+			r := o.rlimit.ReserveN(now, sz)
 			delay := r.DelayFrom(now)
 			if delay > 0 {
 				o.mu.Unlock()
 				select {
 				case <-qch:
+					pmsg.returnToPool()
 					return
 				case <-time.After(delay):
 				}
@@ -2747,7 +3318,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		}
 
 		// Do actual delivery.
-		o.deliverMsg(dsubj, subj, hdr, msg, seq, dc, ts)
+		o.deliverMsg(dsubj, ackReply, pmsg, dc, rp)
 
 		// Reset our idle heartbeat timer if set.
 		if hb != nil {
@@ -2766,9 +3337,10 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// Make sure to process any expired requests that are pending.
 		var wrExp <-chan time.Time
 		if o.isPullMode() {
-			o.expireWaiting()
-			if o.waiting.len() > 0 && !o.waiting.fexp.IsZero() {
-				expires := time.Until(o.waiting.fexp)
+			// Dont expire oneshots if we are here because of max ack pending limit.
+			_, _, _, fexp := o.processWaiting(err != errMaxAckPending)
+			if !fexp.IsZero() {
+				expires := time.Until(fexp)
 				if expires <= 0 {
 					expires = time.Millisecond
 				}
@@ -2777,33 +3349,27 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		}
 
 		// We will wait here for new messages to arrive.
-		mch, outq, odsubj := o.mch, o.outq, o.cfg.DeliverSubject
+		mch, odsubj := o.mch, o.cfg.DeliverSubject
 		o.mu.Unlock()
 
 		select {
+		case <-mch:
+			// Messages are waiting.
 		case interest := <-inch:
 			// inch can be nil on pull-based, but then this will
 			// just block and not fire.
 			o.updateDeliveryInterest(interest)
 		case <-qch:
 			return
-		case <-mch:
-			// Messages are waiting.
 		case <-wrExp:
 			o.mu.Lock()
-			o.expireWaiting()
+			o.processWaiting(true)
 			o.mu.Unlock()
 		case <-hbc:
 			if o.isActive() {
-				const t = "NATS/1.0 100 Idle Heartbeat\r\n%s: %d\r\n%s: %d\r\n\r\n"
-				sseq, dseq := o.lastDelivered()
-				hdr := []byte(fmt.Sprintf(t, JSLastConsumerSeq, dseq, JSLastStreamSeq, sseq))
-				if fcp := o.fcID(); fcp != _EMPTY_ {
-					// Add in that we are stalled on flow control here.
-					addOn := []byte(fmt.Sprintf("%s: %s\r\n\r\n", JSConsumerStalled, fcp))
-					hdr = append(hdr[:len(hdr)-LEN_CR_LF], []byte(addOn)...)
-				}
-				outq.send(newJSPubMsg(odsubj, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+				o.mu.RLock()
+				o.sendIdleHeartbeat(odsubj)
+				o.mu.RUnlock()
 			}
 			// Reset our idle heartbeat timer.
 			hb.Reset(hbd)
@@ -2811,10 +3377,17 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	}
 }
 
-func (o *consumer) lastDelivered() (sseq, dseq uint64) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	return o.sseq - 1, o.dseq - 1
+// Lock should be held.
+func (o *consumer) sendIdleHeartbeat(subj string) {
+	const t = "NATS/1.0 100 Idle Heartbeat\r\n%s: %d\r\n%s: %d\r\n\r\n"
+	sseq, dseq := o.sseq-1, o.dseq-1
+	hdr := []byte(fmt.Sprintf(t, JSLastConsumerSeq, dseq, JSLastStreamSeq, sseq))
+	if fcp := o.fcid; fcp != _EMPTY_ {
+		// Add in that we are stalled on flow control here.
+		addOn := []byte(fmt.Sprintf("%s: %s\r\n\r\n", JSConsumerStalled, fcp))
+		hdr = append(hdr[:len(hdr)-LEN_CR_LF], []byte(addOn)...)
+	}
+	o.outq.send(newJSPubMsg(subj, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 }
 
 func (o *consumer) ackReply(sseq, dseq, dc uint64, ts int64, pending uint64) string {
@@ -2830,60 +3403,90 @@ func (o *consumer) setMaxPendingBytes(limit int) {
 	}
 }
 
-// We have the case where a consumer can become greedy and pick up a messages before the stream has incremented our pending(sgap).
-// Instead of trying to slow things down and synchronize we will allow this to wrap and go negative (biggest uint64) for a short time.
-// This functions checks for that and returns 0.
 // Lock should be held.
-func (o *consumer) adjustedPending() uint64 {
-	if o.sgap&(1<<63) != 0 {
+func (o *consumer) numPending() uint64 {
+	if o.npcm == 0 {
+		o.streamNumPending()
+	}
+	// This can wrap based on possibly having a dec before the inc. Account for that here.
+	if o.npc&(1<<63) != 0 {
 		return 0
 	}
-	return o.sgap
+	return o.npc
+}
+
+// Will force a set from the stream store of num pending.
+// Depends on delivery policy, for last per subject we calculate differently.
+// Lock should be held.
+func (o *consumer) streamNumPending() uint64 {
+	if o.mset == nil || o.mset.store == nil {
+		o.npc, o.npcm = 0, 0
+	} else if o.cfg.DeliverPolicy == DeliverLastPerSubject {
+		o.npc, o.npcm = 0, 0
+		for _, ss := range o.mset.store.SubjectsState(o.cfg.FilterSubject) {
+			if o.sseq <= ss.Last {
+				o.npc++
+				if ss.Last > o.npcm {
+					o.npcm = ss.Last
+				}
+			}
+		}
+	} else {
+		ss := o.mset.store.FilteredState(o.sseq, o.cfg.FilterSubject)
+		o.npc, o.npcm = ss.Msgs, ss.Last
+	}
+	return o.npc
+}
+
+func convertToHeadersOnly(pmsg *jsPubMsg) {
+	// If headers only do not send msg payload.
+	// Add in msg size itself as header.
+	hdr, msg := pmsg.hdr, pmsg.msg
+	var bb bytes.Buffer
+	if len(hdr) == 0 {
+		bb.WriteString(hdrLine)
+	} else {
+		bb.Write(hdr)
+		bb.Truncate(len(hdr) - LEN_CR_LF)
+	}
+	bb.WriteString(JSMsgSize)
+	bb.WriteString(": ")
+	bb.WriteString(strconv.FormatInt(int64(len(msg)), 10))
+	bb.WriteString(CR_LF)
+	bb.WriteString(CR_LF)
+	// Replace underlying buf which we can use directly when we send.
+	// TODO(dlc) - Probably just use directly when forming bytes.Buffer?
+	pmsg.buf = pmsg.buf[:0]
+	pmsg.buf = append(pmsg.buf, bb.Bytes()...)
+	// Replace with new header.
+	pmsg.hdr = pmsg.buf
+	// Cancel msg payload
+	pmsg.msg = nil
 }
 
 // Deliver a msg to the consumer.
 // Lock should be held and o.mset validated to be non-nil.
-func (o *consumer) deliverMsg(dsubj, subj string, hdr, msg []byte, seq, dc uint64, ts int64) {
+func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64, rp RetentionPolicy) {
 	if o.mset == nil {
+		pmsg.returnToPool()
 		return
-	}
-	// Update pending on first attempt. This can go upside down for a short bit, that is ok.
-	// See adjustedPending().
-	if dc == 1 {
-		o.sgap--
 	}
 
 	dseq := o.dseq
 	o.dseq++
 
-	// If headers only do not send msg payload.
-	// Add in msg size itself as header.
-	if o.cfg.HeadersOnly {
-		var bb bytes.Buffer
-		if len(hdr) == 0 {
-			bb.WriteString(hdrLine)
-		} else {
-			bb.Write(hdr)
-			bb.Truncate(len(hdr) - LEN_CR_LF)
-		}
-		bb.WriteString(JSMsgSize)
-		bb.WriteString(": ")
-		bb.WriteString(strconv.FormatInt(int64(len(msg)), 10))
-		bb.WriteString(CR_LF)
-		bb.WriteString(CR_LF)
-		hdr = bb.Bytes()
-		// Cancel msg payload
-		msg = nil
-	}
+	pmsg.dsubj, pmsg.reply, pmsg.o = dsubj, ackReply, o
+	psz := pmsg.size()
 
-	pmsg := newJSPubMsg(dsubj, subj, o.ackReply(seq, dseq, dc, ts, o.adjustedPending()), hdr, msg, o, seq)
 	if o.maxpb > 0 {
-		o.pbytes += pmsg.size()
+		o.pbytes += psz
 	}
 
 	mset := o.mset
 	ap := o.cfg.AckPolicy
 
+	// Cant touch pmsg after this sending so capture what we need.
+	seq, ts := pmsg.seq, pmsg.ts
 	// Send message.
 	o.outq.send(pmsg)
 
@@ -2895,15 +3498,20 @@ func (o *consumer) deliverMsg(dsubj, subj string, hdr, msg []byte, seq, dc uint6
 	}
 
 	// Flow control.
-	if o.maxpb > 0 && o.needFlowControl() {
+	if o.maxpb > 0 && o.needFlowControl(psz) {
 		o.sendFlowControl()
+	}
+
+	// If pull mode and we have inactivity threshold, signaled by dthresh, update last activity.
+	if o.isPullMode() && o.dthresh > 0 {
+		o.waiting.last = time.Now()
 	}
 
 	// FIXME(dlc) - Capture errors?
 	o.updateDelivered(dseq, seq, dc, ts)
 
 	// If we are ack none and mset is interest only we should make sure stream removes interest.
-	if ap == AckNone && mset.cfg.Retention != LimitsPolicy {
+	if ap == AckNone && rp != LimitsPolicy {
 		if o.node == nil || o.cfg.Direct {
 			mset.ackq.push(seq)
 		} else {
@@ -2912,7 +3520,7 @@ func (o *consumer) deliverMsg(dsubj, subj string, hdr, msg []byte, seq, dc uint6
 	}
 }
 
-func (o *consumer) needFlowControl() bool {
+func (o *consumer) needFlowControl(sz int) bool {
 	if o.maxpb == 0 {
 		return false
 	}
@@ -2920,6 +3528,10 @@ func (o *consumer) needFlowControl() bool {
 	// We send when we are over 50% of our current window limit.
 	if o.fcid == _EMPTY_ && o.pbytes > o.maxpb/2 {
 		return true
+	}
+	// If we have an existing outstanding FC, check to see if we need to expand the o.fcsz
+	if o.fcid != _EMPTY_ && (o.pbytes-o.fcsz) >= o.maxpb {
+		o.fcsz += sz
 	}
 	return false
 }
@@ -2967,12 +3579,6 @@ func (o *consumer) fcReply() string {
 	}
 	sb.Write(b[:])
 	return sb.String()
-}
-
-func (o *consumer) fcID() string {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	return o.fcid
 }
 
 // sendFlowControl will send a flow control packet to the consumer.
@@ -3103,13 +3709,19 @@ func (o *consumer) checkPending() {
 	defer o.mu.Unlock()
 
 	mset := o.mset
-	if mset == nil {
+	// On stop, mset and timer will be nil.
+	if mset == nil || o.ptmr == nil {
 		return
 	}
 
 	now := time.Now().UnixNano()
 	ttl := int64(o.cfg.AckWait)
 	next := int64(o.ackWait(0))
+	// However, if there is backoff, initializes with the largest backoff.
+	// It will be adjusted as needed.
+	if l := len(o.cfg.BackOff); l > 0 {
+		next = int64(o.cfg.BackOff[l-1])
+	}
 
 	var shouldUpdateState bool
 	var state StreamState
@@ -3119,7 +3731,12 @@ func (o *consumer) checkPending() {
 	// Since we can update timestamps, we have to review all pending.
 	// We may want to unlock here or warn if list is big.
 	var expired []uint64
+	check := len(o.pending) > 1024
 	for seq, p := range o.pending {
+		if check && atomic.LoadInt64(&o.awl) > 0 {
+			o.ptmr.Reset(100 * time.Millisecond)
+			return
+		}
 		// Check if these are no longer valid.
 		if seq < fseq {
 			delete(o.pending, seq)
@@ -3129,12 +3746,20 @@ func (o *consumer) checkPending() {
 			continue
 		}
 		elapsed, deadline := now-p.Timestamp, ttl
-		if len(o.cfg.BackOff) > 0 && o.rdc != nil {
+		if len(o.cfg.BackOff) > 0 {
+			// This is ok even if o.rdc is nil, we would get dc == 0, which is what we want.
 			dc := int(o.rdc[seq])
-			if dc >= len(o.cfg.BackOff) {
+			// This will be the index for the next backoff, will set to last element if needed.
+			nbi := dc + 1
+			if dc+1 >= len(o.cfg.BackOff) {
 				dc = len(o.cfg.BackOff) - 1
+				nbi = dc
 			}
 			deadline = int64(o.cfg.BackOff[dc])
+			// Set `next` to the next backoff (if smaller than current `next` value).
+			if nextBackoff := int64(o.cfg.BackOff[nbi]); nextBackoff < next {
+				next = nextBackoff
+			}
 		}
 		if elapsed >= deadline {
 			if !o.onRedeliverQueue(seq) {
@@ -3308,6 +3933,7 @@ func (o *consumer) selectStartingSeqNo() {
 				// TODO(dlc) - Once clustered can't rely on this.
 				o.sseq = o.mset.store.GetSeqFromTime(*o.cfg.OptStartTime)
 			} else {
+				// DeliverNew
 				o.sseq = state.LastSeq + 1
 			}
 		} else {
@@ -3329,6 +3955,11 @@ func (o *consumer) selectStartingSeqNo() {
 	o.adflr = o.dseq - 1
 	// Set ack store floor to store-1
 	o.asflr = o.sseq - 1
+
+	// Set our starting sequence state.
+	if o.store != nil && o.sseq > 0 {
+		o.store.SetStarting(o.sseq - 1)
+	}
 }
 
 // Test whether a config represents a durable subscriber.
@@ -3358,12 +3989,19 @@ func (o *consumer) String() string {
 }
 
 func createConsumerName() string {
-	return string(getHash(nuid.Next()))
+	return getHash(nuid.Next())
 }
 
 // deleteConsumer will delete the consumer from this stream.
 func (mset *stream) deleteConsumer(o *consumer) error {
 	return o.delete()
+}
+
+func (o *consumer) getStream() *stream {
+	o.mu.RLock()
+	mset := o.mset
+	o.mu.RUnlock()
+	return mset
 }
 
 func (o *consumer) streamName() string {
@@ -3395,14 +4033,14 @@ func (o *consumer) hasNoLocalInterest() bool {
 // This is when the underlying stream has been purged.
 // sseq is the new first seq for the stream after purge.
 // Lock should be held.
-func (o *consumer) purge(sseq uint64) {
+func (o *consumer) purge(sseq uint64, slseq uint64) {
 	// Do not update our state unless we know we are the leader.
 	if !o.isLeader() {
 		return
 	}
 	// Signals all have been purged for this consumer.
 	if sseq == 0 {
-		sseq = o.mset.lastSeq() + 1
+		sseq = slseq + 1
 	}
 
 	o.mu.Lock()
@@ -3416,7 +4054,6 @@ func (o *consumer) purge(sseq uint64) {
 			o.adflr = o.dseq - 1
 		}
 	}
-	o.sgap = 0
 	o.pending = nil
 
 	// We need to remove all those being queued for redelivery under o.rdq
@@ -3460,14 +4097,27 @@ func (o *consumer) delete() error {
 
 func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	o.mu.Lock()
+	js := o.js
+
 	if o.closed {
 		o.mu.Unlock()
 		return nil
 	}
 	o.closed = true
 
-	if dflag && advisory && o.isLeader() {
-		o.sendDeleteAdvisoryLocked()
+	// Check if we are the leader and are being deleted.
+	if dflag && o.isLeader() {
+		// If we are clustered and node leader (probable from above), stepdown.
+		if node := o.node; node != nil && node.Leader() {
+			node.StepDown()
+		}
+		if advisory {
+			o.sendDeleteAdvisoryLocked()
+		}
+		if o.isPullMode() {
+			// Release any pending.
+			o.releaseAnyPendingRequests()
+		}
 	}
 
 	if o.qch != nil {
@@ -3505,6 +4155,13 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	}
 	n := o.node
 	qgroup := o.cfg.DeliverGroup
+	o.ackMsgs.unregister()
+
+	// For cleaning up the node assignment.
+	var ca *consumerAssignment
+	if dflag {
+		ca = o.ca
+	}
 	o.mu.Unlock()
 
 	if c != nil {
@@ -3527,13 +4184,18 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 	// We will do this consistently on all replicas. Note that if in clustered mode the
 	// non-leader consumers will need to restore state first.
 	if dflag && rp == InterestPolicy {
-		stop := mset.lastSeq()
+		state := mset.state()
+		stop := state.LastSeq
 		o.mu.Lock()
 		if !o.isLeader() {
-			o.readStoredState()
+			o.readStoredState(stop)
 		}
 		start := o.asflr
 		o.mu.Unlock()
+		// Make sure we start at worst with first sequence in the stream.
+		if start < state.FirstSeq {
+			start = state.FirstSeq
+		}
 
 		var rmseqs []uint64
 		mset.mu.RLock()
@@ -3554,8 +4216,22 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 		if dflag {
 			n.Delete()
 		} else {
+			// Try to install snapshot on clean exit
+			if o.store != nil {
+				if snap, err := o.store.EncodedState(); err == nil {
+					n.InstallSnapshot(snap)
+				}
+			}
 			n.Stop()
 		}
+	}
+
+	if ca != nil {
+		js.mu.Lock()
+		if ca.Group != nil {
+			ca.Group.node = nil
+		}
+		js.mu.Unlock()
 	}
 
 	// Clean up our store.
@@ -3577,11 +4253,8 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 
 // Check that we do not form a cycle by delivering to a delivery subject
 // that is part of the interest group.
-func (mset *stream) deliveryFormsCycle(deliverySubject string) bool {
-	mset.mu.RLock()
-	defer mset.mu.RUnlock()
-
-	for _, subject := range mset.cfg.Subjects {
+func deliveryFormsCycle(cfg *StreamConfig, deliverySubject string) bool {
+	for _, subject := range cfg.Subjects {
 		if subjectIsSubsetMatch(deliverySubject, subject) {
 			return true
 		}
@@ -3609,25 +4282,6 @@ func validFilteredSubject(filteredSubject string, subjects []string) bool {
 	return false
 }
 
-// setInActiveDeleteThreshold sets the delete threshold for how long to wait
-// before deleting an inactive ephemeral consumer.
-func (o *consumer) setInActiveDeleteThreshold(dthresh time.Duration) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if o.isDurable() {
-		return fmt.Errorf("consumer is not ephemeral")
-	}
-	deleteWasRunning := o.dtmr != nil
-	stopAndClearTimer(&o.dtmr)
-	// Do not add jitter if set via here.
-	o.dthresh = dthresh
-	if deleteWasRunning {
-		o.dtmr = time.AfterFunc(o.dthresh, func() { o.deleteNotActive() })
-	}
-	return nil
-}
-
 // switchToEphemeral is called on startup when recovering ephemerals.
 func (o *consumer) switchToEphemeral() {
 	o.mu.Lock()
@@ -3635,14 +4289,7 @@ func (o *consumer) switchToEphemeral() {
 	store, ok := o.store.(*consumerFileStore)
 	rr := o.acc.sl.Match(o.cfg.DeliverSubject)
 	// Setup dthresh.
-	if o.dthresh == 0 {
-		if o.cfg.InactiveThreshold != 0 {
-			o.dthresh = o.cfg.InactiveThreshold
-		} else {
-			// Add in 1 sec of jitter above and beyond the default of 5s.
-			o.dthresh = JsDeleteWaitTimeDefault + time.Duration(rand.Int63n(1000))*time.Millisecond
-		}
-	}
+	o.updateInactiveThreshold(&o.cfg)
 	o.mu.Unlock()
 
 	// Update interest
@@ -3659,65 +4306,11 @@ func (o *consumer) requestNextMsgSubject() string {
 	return o.nextMsgSubj
 }
 
-// Will set the initial pending and start sequence.
-// mset lock should be held.
-func (o *consumer) setInitialPendingAndStart() {
-	mset := o.mset
-	if mset == nil || mset.store == nil {
-		return
-	}
-
-	// !filtered means we want all messages.
-	filtered, dp := o.cfg.FilterSubject != _EMPTY_, o.cfg.DeliverPolicy
-	if filtered {
-		// Check to see if we directly match the configured stream.
-		// Many clients will always send a filtered subject.
-		cfg := &mset.cfg
-		if len(cfg.Subjects) == 1 && cfg.Subjects[0] == o.cfg.FilterSubject {
-			filtered = false
-		}
-	}
-
-	if !filtered && dp != DeliverLastPerSubject {
-		var state StreamState
-		mset.store.FastState(&state)
-		if state.Msgs > 0 {
-			o.sgap = state.Msgs - (o.sseq - state.FirstSeq)
-			o.lsgap = state.LastSeq
-		}
-	} else {
-		// Here we are filtered.
-		if dp == DeliverLastPerSubject && o.hasSkipListPending() && o.sseq < o.lss.resume {
-			ss := mset.store.FilteredState(o.lss.resume+1, o.cfg.FilterSubject)
-			o.sseq = o.lss.seqs[0]
-			o.sgap = ss.Msgs + uint64(len(o.lss.seqs))
-			o.lsgap = ss.Last
-		} else if ss := mset.store.FilteredState(o.sseq, o.cfg.FilterSubject); ss.Msgs > 0 {
-			o.sgap = ss.Msgs
-			o.lsgap = ss.Last
-			// See if we should update our starting sequence.
-			if dp == DeliverLast || dp == DeliverLastPerSubject {
-				o.sseq = ss.Last
-			} else if dp == DeliverNew {
-				o.sseq = ss.Last + 1
-			} else {
-				// DeliverAll, DeliverByStartSequence, DeliverByStartTime
-				o.sseq = ss.First
-			}
-			// Cleanup lss when we take over in clustered mode.
-			if dp == DeliverLastPerSubject && o.hasSkipListPending() && o.sseq >= o.lss.resume {
-				o.lss = nil
-			}
-		}
-		o.updateSkipped()
-	}
-}
-
 func (o *consumer) decStreamPending(sseq uint64, subj string) {
 	o.mu.Lock()
-	// Ignore if we have already seen this one.
-	if sseq >= o.sseq && o.sgap > 0 && o.isFilteredMatch(subj) {
-		o.sgap--
+	// Update our cached num pending. Only do so if we think deliverMsg has not done so.
+	if sseq > o.npcm && sseq >= o.sseq && o.isFilteredMatch(subj) {
+		o.npc--
 	}
 	// Check if this message was pending.
 	p, wasPending := o.pending[sseq]
@@ -3730,7 +4323,8 @@ func (o *consumer) decStreamPending(sseq uint64, subj string) {
 	// If it was pending process it like an ack.
 	// TODO(dlc) - we could do a term here instead with a reason to generate the advisory.
 	if wasPending {
-		o.processAckMsg(sseq, p.Sequence, rdc, false)
+		// We could have lock for stream so do this in a go routine.
+		go o.processTerm(sseq, p.Sequence, rdc)
 	}
 }
 
@@ -3739,4 +4333,43 @@ func (o *consumer) account() *Account {
 	a := o.acc
 	o.mu.RUnlock()
 	return a
+}
+
+func (o *consumer) signalSub() *subscription {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.sigSub != nil {
+		return o.sigSub
+	}
+
+	subject := o.cfg.FilterSubject
+	if subject == _EMPTY_ {
+		subject = fwcs
+	}
+	return &subscription{subject: []byte(subject), icb: o.processStreamSignal}
+}
+
+// This is what will be called when our parent stream wants to kick us regarding a new message.
+// We know that we are the leader and that this subject matches us by how the parent handles registering
+// us with the signaling sublist.
+// We do need the sequence of the message however and we use the msg as the encoded seq.
+func (o *consumer) processStreamSignal(_ *subscription, _ *client, _ *Account, subject, _ string, seqb []byte) {
+	var le = binary.LittleEndian
+	seq := le.Uint64(seqb)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.mset == nil {
+		return
+	}
+	if seq > o.npcm {
+		o.npc++
+	}
+	if seq < o.sseq {
+		return
+	}
+	if o.isPushMode() && o.active || o.isPullMode() && !o.waiting.isEmpty() {
+		o.signalNewMessages()
+	}
 }
